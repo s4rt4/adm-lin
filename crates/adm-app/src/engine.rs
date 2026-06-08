@@ -1,9 +1,6 @@
-//! Manajer engine in-process (plan §4, WM2).
-//!
-//! Membungkus `adm-core` di atas runtime tokio bersama. Setiap unduhan jadi
-//! task tokio; token cancel disimpan agar Pause/Stop All dari UI bisa
-//! menghentikannya. Event lifecycle dialirkan lewat `EventSink` (GUI mem-post
-//! ke UI thread; test mengumpulkan ke channel).
+//! Manajer engine in-process (plan §4). Membungkus `adm-core` di runtime
+//! tokio bersama; tiap unduhan = task dengan `CancelToken` (untuk pause/stop,
+//! per-item maupun all). Event lifecycle dialirkan lewat `EventSink`.
 
 use adm_core::{download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb};
 use adm_ipc::DownloadAddParams;
@@ -44,21 +41,48 @@ impl EngineHandle {
         }
     }
 
-    /// Jumlah unduhan yang sedang aktif.
+    pub fn download_dir(&self) -> &std::path::Path {
+        &self.download_dir
+    }
+
     pub fn active_count(&self) -> usize {
         self.active.lock().unwrap().len()
     }
 
-    /// Batalkan semua unduhan aktif (Pause/Stop All). Sidecar tetap → resumable.
-    pub fn cancel_all(&self) {
-        for token in self.active.lock().unwrap().values() {
-            token.cancel();
+    /// Batalkan satu unduhan (sidecar tetap → resumable).
+    pub fn cancel(&self, id: u64) {
+        if let Some(t) = self.active.lock().unwrap().get(&id) {
+            t.cancel();
         }
     }
 
-    /// Tambah & mulai unduhan. Mengembalikan id.
+    /// Batalkan semua (Pause/Stop All).
+    pub fn cancel_all(&self) {
+        for t in self.active.lock().unwrap().values() {
+            t.cancel();
+        }
+    }
+
+    /// Tambah unduhan baru; kembalikan id.
     pub fn add(&self, params: DownloadAddParams) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.start(id, params);
+        id
+    }
+
+    /// Lanjutkan unduhan yang sudah ada (id dipakai ulang → baris tak duplikat).
+    pub fn resume(&self, id: u64, url: String, filename: String) {
+        self.start(
+            id,
+            DownloadAddParams {
+                url,
+                filename: Some(filename),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn start(&self, id: u64, params: DownloadAddParams) {
         let output = self.download_dir.join(pick_filename(&params, id));
         let cancel = CancelToken::new();
         self.active.lock().unwrap().insert(id, cancel.clone());
@@ -98,8 +122,6 @@ impl EngineHandle {
             };
             sink(ev);
         });
-
-        id
     }
 }
 

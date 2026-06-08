@@ -4,11 +4,13 @@
 //! `gui`/`state`/`tray`/`autostart`/`single_instance` adalah lapisan Windows.
 
 pub mod autostart;
+pub mod dialogs;
 pub mod engine;
 pub mod gui;
 pub mod ipc_server;
 pub mod single_instance;
 pub mod state;
+pub mod store;
 
 use std::path::PathBuf;
 

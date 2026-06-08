@@ -1,0 +1,15 @@
+# Standalone (detached dari workspace utama) — hanya untuk regenerasi ikon.
+# Jalankan: cargo run --manifest-path tools/icongen/Cargo.toml
+[workspace]
+
+[package]
+name = "icongen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+resvg = "0.44"
+usvg = "0.44"
+tiny-skia = "0.11"
+ico = "0.3"
