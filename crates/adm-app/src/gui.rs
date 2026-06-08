@@ -820,7 +820,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_EXIT => request_exit(hwnd),
         // Fitur milestone lain.
         ID_SCHEDULER => crate::scheduler::show(hwnd),
-        ID_OPTIONS => info(hwnd, "Options menyusul (WM7)."),
+        ID_OPTIONS => crate::options::show(hwnd),
         ID_SL_UNLIM => set_global_limit(0),
         ID_SL_50 => set_global_limit(50 * 1024),
         ID_SL_100 => set_global_limit(100 * 1024),
@@ -878,7 +878,7 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
     }
     let Some(engine) = ENGINE.get() else { return };
     let filename = row.filename();
-    let mut newdir = engine.download_dir().to_path_buf();
+    let mut newdir = engine.download_dir();
     if let Some(f) = cat.folder() {
         newdir.push(f);
     }
@@ -898,7 +898,8 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
 
 unsafe fn do_add(hwnd: HWND) {
     let Some(engine) = ENGINE.get() else { return };
-    if let Some((params, start_now)) = dialogs::add_dialog(hwnd, "", engine.download_dir()) {
+    let dir = engine.download_dir();
+    if let Some((params, start_now)) = dialogs::add_dialog(hwnd, "", &dir) {
         if start_now {
             engine.add(params);
         } else {

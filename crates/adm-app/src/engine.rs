@@ -8,7 +8,7 @@ use crate::category::Category;
 use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome, Progress, ProgressCb};
 use adm_ipc::DownloadAddParams;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
@@ -44,7 +44,7 @@ struct QueueState {
 #[derive(Clone)]
 pub struct EngineHandle {
     handle: Handle,
-    download_dir: PathBuf,
+    download_dir: Arc<Mutex<PathBuf>>,
     sink: EventSink,
     active: Arc<Mutex<ActiveMap>>,
     next_id: Arc<AtomicU64>,
@@ -57,7 +57,7 @@ impl EngineHandle {
     pub fn new(handle: Handle, download_dir: PathBuf, sink: EventSink) -> Self {
         Self {
             handle,
-            download_dir,
+            download_dir: Arc::new(Mutex::new(download_dir)),
             sink,
             active: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
@@ -83,8 +83,12 @@ impl EngineHandle {
         }
     }
 
-    pub fn download_dir(&self) -> &Path {
-        &self.download_dir
+    pub fn download_dir(&self) -> PathBuf {
+        self.download_dir.lock().unwrap().clone()
+    }
+
+    pub fn set_download_dir(&self, dir: PathBuf) {
+        *self.download_dir.lock().unwrap() = dir;
     }
 
     pub fn active_count(&self) -> usize {
@@ -177,7 +181,7 @@ impl EngineHandle {
 
     fn output_for(&self, params: &DownloadAddParams, id: u64) -> PathBuf {
         let filename = pick_filename(params, id);
-        let mut dir = self.download_dir.clone();
+        let mut dir = self.download_dir.lock().unwrap().clone();
         if let Some(folder) = Category::from_filename(&filename).folder() {
             dir.push(folder);
         }

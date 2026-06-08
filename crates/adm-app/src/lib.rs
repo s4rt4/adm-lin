@@ -9,6 +9,7 @@ pub mod dialogs;
 pub mod engine;
 pub mod gui;
 pub mod ipc_server;
+pub mod options;
 pub mod progress;
 pub mod scheduler;
 pub mod settings;
