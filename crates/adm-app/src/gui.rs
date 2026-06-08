@@ -478,15 +478,15 @@ unsafe fn add_toolbar_buttons(tb: HWND) {
     mkbtn(&mut buttons, ID_STOP, "Stop", 2, false);
     mkbtn(&mut buttons, ID_STOP_ALL, "Stop All", 3, false);
     mkbtn(&mut buttons, ID_DELETE, "Delete", 4, false);
-    mkbtn(&mut buttons, ID_DELETE_COMPLETED, "Delete Co...", 5, false);
+    mkbtn(&mut buttons, ID_DELETE_COMPLETED, "Delete Completed", 5, false);
     mksep(&mut buttons);
     mkbtn(&mut buttons, ID_OPTIONS, "Options", 6, false);
     mkbtn(&mut buttons, ID_SCHEDULER, "Scheduler", 7, false);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_START_QUEUE, "Start Qu...", 8, true);
-    mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Qu...", 9, true);
+    mkbtn(&mut buttons, ID_START_QUEUE, "Start Queue", 8, true);
+    mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Queue", 9, true);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_TELL_FRIEND, "Tell a Fri...", 10, false);
+    mkbtn(&mut buttons, ID_TELL_FRIEND, "Share", 10, false);
 
     SendMessageW(
         tb,
