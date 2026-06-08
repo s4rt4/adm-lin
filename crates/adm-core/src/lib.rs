@@ -18,6 +18,7 @@ pub use download::{
     download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb, SegmentProgress,
 };
 pub use error::{Error, Result};
+pub use limiter::Limiter;
 pub use probe::{probe, Probe};
 
 /// Versi crate, dipakai a.l. untuk balasan `daemon.ping`.

@@ -18,6 +18,8 @@ static REG: AtomicBool = AtomicBool::new(false);
 
 const IDC_PAUSE: usize = 1;
 const IDC_CANCEL: usize = 2;
+const IDC_SL_CHECK: usize = 10;
+const IDC_SL_EDIT: usize = 11;
 const TIMER_ID: usize = 1;
 
 // Warna segmen (palet beragam) untuk porsi terunduh.
@@ -48,6 +50,8 @@ struct DlgData {
     btn_pause: HWND,
     tab: HWND,
     tabs: [Vec<HWND>; 3],
+    chk_limit: HWND,
+    edit_limit: HWND,
 }
 
 unsafe fn gui_font() -> HGDIOBJ {
@@ -231,9 +235,11 @@ pub fn open(parent: HWND, id: u64) {
         // ---- Tab 2: Speed Limiter (kontrol kosmetik untuk WM4) ----
         let mut t2 = Vec::new();
         t2.push(label(dlg, "Use the speed limiter to reduce bandwidth usage.", 20, 50, 480));
-        t2.push(mk(dlg, w!("BUTTON"), w!("Use Speed Limiter"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 80, 200, 20, 0));
+        let chk_limit = mk(dlg, w!("BUTTON"), w!("Use Speed Limiter"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 80, 200, 20, IDC_SL_CHECK);
+        t2.push(chk_limit);
         t2.push(label(dlg, "Maximum download speed:", 20, 112, 160));
-        t2.push(mk(dlg, w!("EDIT"), w!("0"), WINDOW_STYLE(WS_BORDER.0 | ES_NUMBER as u32), 190, 110, 80, 22, 0));
+        let edit_limit = mk(dlg, w!("EDIT"), w!("0"), WINDOW_STYLE(WS_BORDER.0 | ES_NUMBER as u32), 190, 110, 80, 22, IDC_SL_EDIT);
+        t2.push(edit_limit);
         t2.push(label(dlg, "KBytes/sec", 280, 112, 80));
         t2.push(mk(dlg, w!("BUTTON"), w!("Remember setting on stop/resume"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 20, 144, 300, 20, 0));
         for h in &t2 {
@@ -279,6 +285,8 @@ pub fn open(parent: HWND, id: u64) {
             btn_pause,
             tab,
             tabs: [t1, t2, t3],
+            chk_limit,
+            edit_limit,
         });
         SetWindowLongPtrW(dlg, GWLP_USERDATA, Box::into_raw(data) as isize);
 
@@ -388,9 +396,12 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
+                let code = (wparam.0 >> 16) & 0xFFFF;
                 if let Some(d) = data_of(hwnd) {
                     let did = d.id;
                     match id {
+                        IDC_SL_CHECK => apply_limit(hwnd),
+                        IDC_SL_EDIT if code == EN_KILLFOCUS as usize => apply_limit(hwnd),
                         IDC_PAUSE => {
                             if let Some(e) = crate::gui::engine() {
                                 if let Some(r) = store::get(did) {
@@ -430,6 +441,27 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
+}
+
+/// Terapkan batas kecepatan per-unduhan dari tab Speed Limiter.
+unsafe fn apply_limit(hwnd: HWND) {
+    let Some(d) = data_of(hwnd) else { return };
+    let checked = SendMessageW(d.chk_limit, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
+    let kb = read_uint(d.edit_limit);
+    let bps = if checked { kb * 1024 } else { 0 };
+    if let Some(e) = crate::gui::engine() {
+        e.set_limit(d.id, bps);
+    }
+}
+
+unsafe fn read_uint(hwnd: HWND) -> u64 {
+    let len = GetWindowTextLengthW(hwnd);
+    if len <= 0 {
+        return 0;
+    }
+    let mut buf = vec![0u16; len as usize + 1];
+    let n = GetWindowTextW(hwnd, &mut buf);
+    String::from_utf16_lossy(&buf[..n as usize]).trim().parse().unwrap_or(0)
 }
 
 // ============================ SegmentBar ============================

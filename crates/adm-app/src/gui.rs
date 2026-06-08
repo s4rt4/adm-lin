@@ -72,8 +72,15 @@ const ID_FIND_NEXT: usize = 0x124;
 const ID_SCHEDULER: usize = 0x125;
 const ID_START_QUEUE: usize = 0x126;
 const ID_STOP_QUEUE: usize = 0x127;
-const ID_SPEED_LIMITER: usize = 0x128;
 const ID_OPTIONS: usize = 0x129;
+
+// Speed Limiter global (preset).
+const ID_SL_UNLIM: usize = 0x160;
+const ID_SL_50: usize = 0x161;
+const ID_SL_100: usize = 0x162;
+const ID_SL_500: usize = 0x163;
+const ID_SL_1M: usize = 0x164;
+const ID_SL_5M: usize = 0x165;
 
 const ID_HIDE_CATEGORIES: usize = 0x130;
 const ID_ARRANGE: usize = 0x131;
@@ -429,7 +436,14 @@ unsafe fn build_menu() -> HMENU {
     append(dl, ID_SCHEDULER, w!("Scheduler..."));
     append(dl, ID_START_QUEUE, w!("Start queue"));
     append(dl, ID_STOP_QUEUE, w!("Stop queue"));
-    append(dl, ID_SPEED_LIMITER, w!("Speed Limiter"));
+    let sl = CreatePopupMenu().unwrap();
+    append(sl, ID_SL_UNLIM, w!("Unlimited"));
+    append(sl, ID_SL_50, w!("50 KB/s"));
+    append(sl, ID_SL_100, w!("100 KB/s"));
+    append(sl, ID_SL_500, w!("500 KB/s"));
+    append(sl, ID_SL_1M, w!("1 MB/s"));
+    append(sl, ID_SL_5M, w!("5 MB/s"));
+    popup(dl, sl, w!("Speed Limiter"));
     sep(dl);
     append(dl, ID_OPTIONS, w!("Options..."));
     popup(menu, dl, w!("Downloads"));
@@ -791,7 +805,12 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         // Fitur milestone lain.
         ID_SCHEDULER => info(hwnd, "Scheduler menyusul (WM6)."),
         ID_OPTIONS => info(hwnd, "Options menyusul (WM7)."),
-        ID_SPEED_LIMITER => info(hwnd, "Speed Limiter UI menyusul (WM6)."),
+        ID_SL_UNLIM => set_global_limit(0),
+        ID_SL_50 => set_global_limit(50 * 1024),
+        ID_SL_100 => set_global_limit(100 * 1024),
+        ID_SL_500 => set_global_limit(500 * 1024),
+        ID_SL_1M => set_global_limit(1024 * 1024),
+        ID_SL_5M => set_global_limit(5 * 1024 * 1024),
         ID_START_QUEUE => {
             if let Some(e) = ENGINE.get() {
                 e.start_queue();
@@ -927,6 +946,12 @@ unsafe fn refresh_ui(hwnd: HWND) {
     // Dialog "Download complete" untuk unduhan yang baru selesai (§9.14).
     for row in store::take_newly_completed() {
         crate::progress::show_complete(hwnd, &row);
+    }
+}
+
+fn set_global_limit(bps: u64) {
+    if let Some(e) = ENGINE.get() {
+        e.set_global_limit(bps);
     }
 }
 

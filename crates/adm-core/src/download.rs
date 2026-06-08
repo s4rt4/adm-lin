@@ -36,8 +36,6 @@ pub struct DownloadRequest {
     pub output: PathBuf,
     /// jumlah koneksi yang diinginkan (di-clamp ke [1, 64]).
     pub connections: usize,
-    /// batas kecepatan global (byte/detik); `None` = tanpa batas.
-    pub speed_limit_bps: Option<u64>,
 }
 
 /// Snapshot progres untuk callback.
@@ -99,6 +97,8 @@ pub async fn download(
     req: DownloadRequest,
     cancel: CancelToken,
     on_progress: Option<ProgressCb>,
+    per_limiter: Arc<Limiter>,
+    global_limiter: Arc<Limiter>,
 ) -> Result<Outcome> {
     let client = build_client()?;
     let pr = probe::probe(&client, &req.url).await?;
@@ -106,7 +106,7 @@ pub async fn download(
 
     // Jalur non-resumable: ukuran tak diketahui atau Range tak didukung.
     if !pr.resumable {
-        return download_single(&client, &req, cancel, on_progress, pr.total).await;
+        return download_single(&client, &req, cancel, on_progress, pr.total, per_limiter, global_limiter).await;
     }
 
     let total = pr.total.ok_or(Error::UnknownSize)?;
@@ -135,7 +135,6 @@ pub async fn download(
         .map(|s| s.downloaded.load(Ordering::Relaxed))
         .sum();
     let global = Arc::new(AtomicU64::new(downloaded0));
-    let limiter = Arc::new(Limiter::new(req.speed_limit_bps));
 
     // Tulis sidecar awal (agar crash sebelum flush pertama tetap resumable).
     write_sidecar(&sidecar_path, &req, &pr, total, &segments);
@@ -161,7 +160,8 @@ pub async fn download(
             req.url.clone(),
             seg.clone(),
             req.output.clone(),
-            limiter.clone(),
+            per_limiter.clone(),
+            global_limiter.clone(),
             cancel.clone(),
             global.clone(),
         ));
@@ -240,7 +240,8 @@ async fn run_segment(
     url: String,
     seg: Arc<SegState>,
     output: PathBuf,
-    limiter: Arc<Limiter>,
+    per_limiter: Arc<Limiter>,
+    global_limiter: Arc<Limiter>,
     cancel: CancelToken,
     global: Arc<AtomicU64>,
 ) -> Result<()> {
@@ -276,7 +277,8 @@ async fn run_segment(
         if data.is_empty() {
             break;
         }
-        limiter.acquire(data.len()).await;
+        per_limiter.acquire(data.len()).await;
+        global_limiter.acquire(data.len()).await;
         platform::write_at(&file, data, offset)?;
         let n = data.len() as u64;
         offset += n;
@@ -290,12 +292,15 @@ async fn run_segment(
 }
 
 /// Jalur satu-koneksi tanpa resume (server tanpa Range / ukuran tak diketahui).
+#[allow(clippy::too_many_arguments)]
 async fn download_single(
     client: &Client,
     req: &DownloadRequest,
     cancel: CancelToken,
     on_progress: Option<ProgressCb>,
     total: Option<u64>,
+    per_limiter: Arc<Limiter>,
+    global_limiter: Arc<Limiter>,
 ) -> Result<Outcome> {
     use std::io::Write;
 
@@ -311,7 +316,6 @@ async fn download_single(
         .truncate(true)
         .open(&req.output)?;
 
-    let limiter = Limiter::new(req.speed_limit_bps);
     let mut stream = resp.bytes_stream();
     let mut downloaded = 0u64;
 
@@ -320,7 +324,8 @@ async fn download_single(
             return Ok(Outcome::Paused { downloaded, total });
         }
         let chunk = item?;
-        limiter.acquire(chunk.len()).await;
+        per_limiter.acquire(chunk.len()).await;
+        global_limiter.acquire(chunk.len()).await;
         file.write_all(&chunk)?;
         downloaded += chunk.len() as u64;
         if let Some(cb) = &on_progress {

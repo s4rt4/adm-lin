@@ -5,7 +5,7 @@
 //! slot terisi item berikutnya (`pump`).
 
 use crate::category::Category;
-use adm_core::{download, CancelToken, DownloadRequest, Outcome, Progress, ProgressCb};
+use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome, Progress, ProgressCb};
 use adm_ipc::DownloadAddParams;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,9 @@ pub enum EngineEvent {
 
 pub type EventSink = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
+/// Unduhan aktif: id → (token cancel, limiter per-unduhan).
+type ActiveMap = HashMap<u64, (CancelToken, Arc<Limiter>)>;
+
 struct QueueState {
     running: bool,
     max: usize,
@@ -43,9 +46,11 @@ pub struct EngineHandle {
     handle: Handle,
     download_dir: PathBuf,
     sink: EventSink,
-    active: Arc<Mutex<HashMap<u64, CancelToken>>>,
+    active: Arc<Mutex<ActiveMap>>,
     next_id: Arc<AtomicU64>,
     queue: Arc<Mutex<QueueState>>,
+    /// Limiter global (dibagi semua unduhan); live-adjustable.
+    global_limiter: Arc<Limiter>,
 }
 
 impl EngineHandle {
@@ -62,6 +67,19 @@ impl EngineHandle {
                 pending: VecDeque::new(),
                 running_ids: HashSet::new(),
             })),
+            global_limiter: Arc::new(Limiter::unlimited()),
+        }
+    }
+
+    /// Batas kecepatan global (byte/detik; `0` = tanpa batas). Live.
+    pub fn set_global_limit(&self, bps: u64) {
+        self.global_limiter.set_rate(bps);
+    }
+
+    /// Batas kecepatan per-unduhan (byte/detik; `0` = tanpa batas). Live.
+    pub fn set_limit(&self, id: u64, bps: u64) {
+        if let Some((_, lim)) = self.active.lock().unwrap().get(&id) {
+            lim.set_rate(bps);
         }
     }
 
@@ -79,13 +97,13 @@ impl EngineHandle {
     }
 
     pub fn cancel(&self, id: u64) {
-        if let Some(t) = self.active.lock().unwrap().get(&id) {
+        if let Some((t, _)) = self.active.lock().unwrap().get(&id) {
             t.cancel();
         }
     }
 
     pub fn cancel_all(&self) {
-        for t in self.active.lock().unwrap().values() {
+        for (t, _) in self.active.lock().unwrap().values() {
             t.cancel();
         }
     }
@@ -169,13 +187,16 @@ impl EngineHandle {
     fn start(&self, id: u64, params: DownloadAddParams, queued: bool) {
         let output = self.output_for(&params, id);
         let cancel = CancelToken::new();
-        self.active.lock().unwrap().insert(id, cancel.clone());
+        let per_limiter = Arc::new(Limiter::unlimited());
+        self.active
+            .lock()
+            .unwrap()
+            .insert(id, (cancel.clone(), per_limiter.clone()));
 
         let req = DownloadRequest {
             url: params.url.clone(),
             output: output.clone(),
             connections: 8,
-            speed_limit_bps: None,
         };
 
         (self.sink)(EngineEvent::Started { id, url: params.url.clone(), output });
@@ -195,8 +216,9 @@ impl EngineHandle {
         });
 
         let this = self.clone();
+        let global_limiter = self.global_limiter.clone();
         self.handle.spawn(async move {
-            let res = download(req, cancel, Some(on_progress)).await;
+            let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
             active.lock().unwrap().remove(&id);
             // Emit event terminal DULU (slot dianggap selesai) sebelum memulai
             // item antrian berikutnya — agar pengamat tak melihat konkuren palsu.

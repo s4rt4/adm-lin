@@ -1,7 +1,7 @@
 //! Test integrasi engine (kriteria WM1): multi-koneksi + checksum, resume
 //! setelah cancel (mensimulasikan stop/crash), dan fallback non-Range.
 
-use adm_core::{download, CancelToken, DownloadRequest, Outcome};
+use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +11,10 @@ use std::time::Duration;
 use tiny_http::{Header, Response, Server, StatusCode};
 
 const ETAG: &str = "\"adm-test-v1\"";
+
+fn unlimited() -> Arc<Limiter> {
+    Arc::new(Limiter::unlimited())
+}
 
 fn make_payload(n: usize) -> Vec<u8> {
     (0..n)
@@ -139,9 +143,10 @@ async fn multi_connection_checksum() {
         url: format!("{base}/file.bin"),
         output: out.clone(),
         connections: 8,
-        speed_limit_bps: None,
     };
-    let outcome = download(req, CancelToken::new(), None).await.unwrap();
+    let outcome = download(req, CancelToken::new(), None, unlimited(), unlimited())
+        .await
+        .unwrap();
     assert!(matches!(outcome, Outcome::Completed { bytes } if bytes == payload.len() as u64));
 
     let got = read_file(&out);
@@ -173,9 +178,10 @@ async fn resume_after_cancel() {
         url: url.clone(),
         output: out.clone(),
         connections: 4,
-        speed_limit_bps: Some(512 * 1024),
     };
-    let o1 = download(req1, cancel, None).await.unwrap();
+    // batasi 512 KiB/s lewat per-limiter agar cancel sempat di tengah.
+    let per = Arc::new(Limiter::new(512 * 1024));
+    let o1 = download(req1, cancel, None, per, unlimited()).await.unwrap();
     let mid = match o1 {
         Outcome::Paused { downloaded, .. } => downloaded,
         Outcome::Completed { .. } => panic!("seharusnya ter-pause, bukan selesai"),
@@ -188,9 +194,10 @@ async fn resume_after_cancel() {
         url,
         output: out.clone(),
         connections: 4,
-        speed_limit_bps: None,
     };
-    let o2 = download(req2, CancelToken::new(), None).await.unwrap();
+    let o2 = download(req2, CancelToken::new(), None, unlimited(), unlimited())
+        .await
+        .unwrap();
     assert!(matches!(o2, Outcome::Completed { .. }));
 
     let got = read_file(&out);
@@ -209,9 +216,10 @@ async fn fallback_no_range() {
         url: format!("{base}/norange.bin"), // server abaikan Range
         output: out.clone(),
         connections: 8, // diminta 8, tapi engine harus fallback ke 1
-        speed_limit_bps: None,
     };
-    let outcome = download(req, CancelToken::new(), None).await.unwrap();
+    let outcome = download(req, CancelToken::new(), None, unlimited(), unlimited())
+        .await
+        .unwrap();
     assert!(matches!(outcome, Outcome::Completed { .. }));
     let got = read_file(&out);
     assert_eq!(sha256(&got), sha256(&payload));

@@ -1,63 +1,67 @@
-//! Token-bucket speed limiter (plan §7). Global; per-file menyusul di WM6.
+//! Token-bucket speed limiter (plan §7). Rate live-adjustable (atomik) agar
+//! bisa diubah saat unduhan berjalan; `0` = tanpa batas. Dipakai sebagai
+//! limiter per-unduhan maupun global (shared via `Arc`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 pub struct Limiter {
-    inner: Option<Mutex<Bucket>>,
+    /// byte per detik; `0` = tanpa batas.
+    rate: AtomicU64,
+    bucket: Mutex<Bucket>,
 }
 
 struct Bucket {
-    /// byte per detik.
-    rate: f64,
-    /// kapasitas burst (byte).
-    capacity: f64,
     tokens: f64,
     last: Instant,
 }
 
 impl Limiter {
-    /// Tanpa batas.
-    pub fn unlimited() -> Self {
-        Self { inner: None }
-    }
-
-    /// Batasi ke `rate_bps` byte/detik. `0` atau `None` => tanpa batas.
-    pub fn new(rate_bps: Option<u64>) -> Self {
-        match rate_bps {
-            Some(r) if r > 0 => {
-                let rate = r as f64;
-                Self {
-                    inner: Some(Mutex::new(Bucket {
-                        rate,
-                        // burst = 1 detik trafik (min 64 KiB).
-                        capacity: rate.max(64.0 * 1024.0),
-                        tokens: rate,
-                        last: Instant::now(),
-                    })),
-                }
-            }
-            _ => Self::unlimited(),
+    pub fn new(rate_bps: u64) -> Self {
+        Self {
+            rate: AtomicU64::new(rate_bps),
+            bucket: Mutex::new(Bucket {
+                tokens: 0.0,
+                last: Instant::now(),
+            }),
         }
     }
 
-    /// Tahan sampai `n` byte boleh ditransfer.
+    pub fn unlimited() -> Self {
+        Self::new(0)
+    }
+
+    /// Ubah batas (byte/detik) saat berjalan; `0` = tanpa batas.
+    pub fn set_rate(&self, bps: u64) {
+        self.rate.store(bps, Ordering::Relaxed);
+    }
+
+    pub fn rate(&self) -> u64 {
+        self.rate.load(Ordering::Relaxed)
+    }
+
+    /// Tahan sampai `n` byte boleh ditransfer pada rate saat ini.
     pub async fn acquire(&self, n: usize) {
-        let Some(m) = &self.inner else { return };
-        let need = n as f64;
         loop {
+            let rate = self.rate.load(Ordering::Relaxed);
+            if rate == 0 {
+                return; // tanpa batas
+            }
+            let rate_f = rate as f64;
+            let capacity = rate_f.max(64.0 * 1024.0);
+            let need = n as f64;
             let wait = {
-                let mut b = m.lock().await;
+                let mut b = self.bucket.lock().await;
                 let now = Instant::now();
                 let elapsed = now.duration_since(b.last).as_secs_f64();
                 b.last = now;
-                b.tokens = (b.tokens + elapsed * b.rate).min(b.capacity);
+                b.tokens = (b.tokens + elapsed * rate_f).min(capacity);
                 if b.tokens >= need {
                     b.tokens -= need;
                     return;
                 }
-                let deficit = need - b.tokens;
-                Duration::from_secs_f64((deficit / b.rate).min(1.0))
+                Duration::from_secs_f64(((need - b.tokens) / rate_f).min(1.0))
             };
             tokio::time::sleep(wait).await;
         }
