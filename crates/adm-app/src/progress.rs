@@ -4,11 +4,13 @@
 
 use crate::store::{self, Row, Status};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -531,27 +533,171 @@ unsafe fn paint_segbar(hwnd: HWND, id: u64) {
 
 // ============================ Download complete ============================
 
-/// Dialog modal "Download complete" (§9.14).
+// Dialog "Download complete" (§9.14) — kustom, sesuai desain IDM.
+const CMPL_CLASS: PCWSTR = w!("AdmCompleteDialog");
+static CMPL_REG: AtomicBool = AtomicBool::new(false);
+static CMPL_DONE: AtomicBool = AtomicBool::new(false);
+static CMPL_PATH: Mutex<String> = Mutex::new(String::new());
+static CMPL_DONTSHOW: Mutex<isize> = Mutex::new(0); // HWND checkbox
+
+const IDB_OPEN: usize = 1;
+const IDB_OPENWITH: usize = 2;
+const IDB_OPENFOLDER: usize = 3;
+const IDB_CLOSE: usize = 4;
+const IDC_DONTSHOW: usize = 5;
+
+/// Dialog modal "Download complete" (§9.14): Open / Open with… / Open folder /
+/// Close + "Don't show this dialog again". Close hanya menutup (tak membuka file).
 pub fn show_complete(parent: HWND, row: &Row) {
     unsafe {
-        let size = fmt_size(row.size);
-        let bytes = row.size.unwrap_or(row.downloaded);
-        let msg = format!(
-            "Download complete\n\nDownloaded {size} ({bytes} Bytes)\n\nAddress:\n{}\n\nSaved as:\n{}",
-            row.url,
-            row.output.display()
-        );
-        let h = HSTRING::from(msg);
-        let r = MessageBoxW(
-            Some(parent),
-            PCWSTR(h.as_ptr()),
+        let instance: HINSTANCE = match GetModuleHandleW(None) {
+            Ok(h) => h.into(),
+            Err(_) => return,
+        };
+        if !CMPL_REG.swap(true, Ordering::SeqCst) {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(cmpl_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void),
+                lpszClassName: CMPL_CLASS,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+        }
+        CMPL_DONE.store(false, Ordering::SeqCst);
+        *CMPL_PATH.lock().unwrap() = row.output.to_string_lossy().into_owned();
+
+        let (dw, dh) = (520, 250);
+        let mut pr = RECT::default();
+        let _ = GetWindowRect(parent, &mut pr);
+        let x = (pr.left + ((pr.right - pr.left) - dw) / 2).max(0);
+        let y = (pr.top + ((pr.bottom - pr.top) - dh) / 2).max(0);
+
+        let dlg = CreateWindowExW(
+            WS_EX_DLGMODALFRAME,
+            CMPL_CLASS,
             w!("Download complete"),
-            MB_OKCANCEL | MB_ICONINFORMATION,
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            x, y, dw, dh,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
         );
-        // OK = buka file.
-        if r == IDOK {
-            let hp = HSTRING::from(row.output.to_string_lossy().into_owned());
-            ShellExecuteW(None, w!("open"), PCWSTR(hp.as_ptr()), None, None, SW_SHOWNORMAL);
+        let Ok(dlg) = dlg else { return };
+
+        // Ikon info.
+        let ico = mk(dlg, w!("STATIC"), PCWSTR::null(), WINDOW_STYLE(0x0000_0003), 16, 16, 32, 32, 0); // SS_ICON
+        if let Ok(hic) = LoadIconW(None, IDI_INFORMATION) {
+            SendMessageW(ico, STM_SETICON, Some(WPARAM(hic.0 as usize)), Some(LPARAM(0)));
+        }
+
+        let _ = mk(dlg, w!("STATIC"), w!("Download complete"), WINDOW_STYLE(0), 60, 16, 380, 18, 0);
+        let sz = fmt_size(row.size);
+        let bytes = row.size.unwrap_or(row.downloaded);
+        let head = HSTRING::from(format!("Downloaded {sz} ({bytes} Bytes)"));
+        let _ = mk(dlg, w!("STATIC"), PCWSTR(head.as_ptr()), WINDOW_STYLE(0), 60, 36, 440, 18, 0);
+
+        let _ = mk(dlg, w!("STATIC"), w!("Address"), WINDOW_STYLE(0), 16, 62, 200, 16, 0);
+        let url_edit = mk(
+            dlg, w!("EDIT"), PCWSTR::null(),
+            WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_READONLY as u32),
+            16, 80, 488, 22, 0,
+        );
+        let hu = HSTRING::from(row.url.clone());
+        let _ = SetWindowTextW(url_edit, PCWSTR(hu.as_ptr()));
+
+        let _ = mk(dlg, w!("STATIC"), w!("The file saved as"), WINDOW_STYLE(0), 16, 110, 200, 16, 0);
+        let path_edit = mk(
+            dlg, w!("EDIT"), PCWSTR::null(),
+            WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32 | ES_READONLY as u32),
+            16, 128, 488, 22, 0,
+        );
+        let hpth = HSTRING::from(row.output.to_string_lossy().into_owned());
+        let _ = SetWindowTextW(path_edit, PCWSTR(hpth.as_ptr()));
+
+        let _ = mk(dlg, w!("BUTTON"), w!("Open"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 16, 166, 100, 28, IDB_OPEN);
+        let _ = mk(dlg, w!("BUTTON"), w!("Open with..."), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 124, 166, 110, 28, IDB_OPENWITH);
+        let _ = mk(dlg, w!("BUTTON"), w!("Open folder"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 242, 166, 110, 28, IDB_OPENFOLDER);
+        let _ = mk(dlg, w!("BUTTON"), w!("Close"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 404, 166, 100, 28, IDB_CLOSE);
+
+        let chk = mk(dlg, w!("BUTTON"), w!("Don't show this dialog again"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 16, 206, 260, 20, IDC_DONTSHOW);
+        *CMPL_DONTSHOW.lock().unwrap() = chk.0 as isize;
+
+        let _ = EnableWindow(parent, false);
+        let _ = ShowWindow(dlg, SW_SHOW);
+        let _ = SetForegroundWindow(dlg);
+
+        let mut msg = MSG::default();
+        while !CMPL_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if !IsDialogMessageW(dlg, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+
+        // "Don't show again" → simpan preferensi.
+        let dont = {
+            let h = *CMPL_DONTSHOW.lock().unwrap();
+            h != 0 && SendMessageW(HWND(h as *mut core::ffi::c_void), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1
+        };
+        if dont {
+            crate::settings::update(|s| s.show_complete_dialog = false);
+        }
+
+        let _ = EnableWindow(parent, true);
+        let _ = SetForegroundWindow(parent);
+        if IsWindow(Some(dlg)).as_bool() {
+            let _ = DestroyWindow(dlg);
+        }
+    }
+}
+
+extern "system" fn cmpl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                let path = CMPL_PATH.lock().unwrap().clone();
+                let hp = HSTRING::from(path.clone());
+                match id {
+                    IDB_OPEN => {
+                        ShellExecuteW(None, w!("open"), PCWSTR(hp.as_ptr()), None, None, SW_SHOWNORMAL);
+                        CMPL_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDB_OPENWITH => {
+                        // Verb "openas" → dialog "Open With" Windows.
+                        ShellExecuteW(None, w!("openas"), PCWSTR(hp.as_ptr()), None, None, SW_SHOWNORMAL);
+                        CMPL_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDB_OPENFOLDER => {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(format!("/select,{path}"))
+                            .spawn();
+                        CMPL_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDB_CLOSE => {
+                        CMPL_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC => {
+                SetBkMode(HDC(wparam.0 as *mut _), TRANSPARENT);
+                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+            }
+            WM_CLOSE => {
+                CMPL_DONE.store(true, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 }

@@ -20,6 +20,8 @@ pub struct Settings {
     pub autostart: bool,
     /// bahasa UI ("en" / "id").
     pub language: String,
+    /// tampilkan dialog "Download complete" saat unduhan selesai (§9.14).
+    pub show_complete_dialog: bool,
 }
 
 impl Default for Settings {
@@ -31,6 +33,7 @@ impl Default for Settings {
             global_limit_kbps: 0,
             autostart: false,
             language: "en".into(),
+            show_complete_dialog: true,
         }
     }
 }

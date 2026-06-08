@@ -1105,8 +1105,11 @@ unsafe fn refresh_ui(hwnd: HWND) {
     let _ = SetWindowTextW(hwnd, PCWSTR(h.as_ptr()));
 
     // Dialog "Download complete" untuk unduhan yang baru selesai (§9.14).
+    let show_complete = crate::settings::get().show_complete_dialog;
     for row in store::take_newly_completed() {
-        crate::progress::show_complete(hwnd, &row);
+        if show_complete {
+            crate::progress::show_complete(hwnd, &row);
+        }
     }
 }
 
