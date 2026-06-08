@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::*;
@@ -16,6 +17,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 static ENGINE: OnceLock<EngineHandle> = OnceLock::new();
 /// Filter aktif dari sidebar kategori (kode = lParam node tree).
 static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// HMENU submenu Theme (untuk radio-check).
+static THEME_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 // Kode filter (lParam node tree).
 const F_ALL: u8 = 0;
@@ -239,8 +242,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CREATE => {
                 let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
                 create_children(hwnd, instance);
+                apply_theme(hwnd);
+                update_theme_checks();
                 layout(hwnd);
                 LRESULT(0)
+            }
+            WM_SETTINGCHANGE => {
+                // Tema sistem berubah → re-apply bila mode = System.
+                if crate::settings::get().theme == crate::settings::THEME_SYSTEM {
+                    apply_theme(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_SIZE => {
                 layout(hwnd);
@@ -303,7 +315,7 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     .unwrap_or_default();
     SendMessageW(tb, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
     SendMessageW(tb, TB_SETEXTENDEDSTYLE, Some(WPARAM(0)), Some(LPARAM((TBSTYLE_EX_MIXEDBUTTONS | TBSTYLE_EX_DRAWDDARROWS) as isize)));
-    let himl = build_toolbar_imagelist();
+    let himl = build_toolbar_imagelist(false);
     SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
     add_toolbar_buttons(tb);
     SendMessageW(tb, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -462,6 +474,7 @@ unsafe fn build_menu() -> HMENU {
     append(theme, ID_THEME_DARK, w!("Dark"));
     append(theme, ID_THEME_LIGHT, w!("Light"));
     append(theme, ID_THEME_SYSTEM, w!("System"));
+    THEME_MENU.store(theme.0 as isize, Ordering::SeqCst);
     popup(view, theme, w!("Theme"));
     append(view, ID_FONT, w!("Font..."));
     append(view, ID_LANGUAGE, w!("Language"));
@@ -798,9 +811,9 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             state::SIDEBAR_VISIBLE.store(v, Ordering::SeqCst);
             layout(hwnd);
         }
-        ID_THEME_DARK | ID_THEME_LIGHT | ID_THEME_SYSTEM => {
-            info(hwnd, "Tema akan diterapkan penuh di WM7.");
-        }
+        ID_THEME_DARK => set_theme(hwnd, crate::settings::THEME_DARK),
+        ID_THEME_LIGHT => set_theme(hwnd, crate::settings::THEME_LIGHT),
+        ID_THEME_SYSTEM => set_theme(hwnd, crate::settings::THEME_SYSTEM),
         ID_ABOUT => {
             info(hwnd, "Alpha Download Manager (ADM)\nVersi 0.1.0\nDownload manager native Windows.");
         }
@@ -1006,6 +1019,26 @@ fn set_global_limit(bps: u64) {
     }
 }
 
+unsafe fn set_theme(hwnd: HWND, theme: u8) {
+    crate::settings::update(|s| s.theme = theme);
+    apply_theme(hwnd);
+    update_theme_checks();
+}
+
+unsafe fn update_theme_checks() {
+    let h = THEME_MENU.load(Ordering::SeqCst);
+    if h == 0 {
+        return;
+    }
+    let menu = HMENU(h as *mut core::ffi::c_void);
+    let sel = match crate::settings::get().theme {
+        crate::settings::THEME_DARK => ID_THEME_DARK,
+        crate::settings::THEME_LIGHT => ID_THEME_LIGHT,
+        _ => ID_THEME_SYSTEM,
+    };
+    let _ = CheckMenuRadioItem(menu, ID_THEME_DARK as u32, ID_THEME_SYSTEM as u32, sel as u32, MF_BYCOMMAND.0);
+}
+
 fn info(hwnd: HWND, msg: &str) {
     let h = HSTRING::from(msg);
     unsafe {
@@ -1094,8 +1127,13 @@ fn fmt_eta(secs: Option<u64>) -> String {
 /// Blob ikon toolbar (11 × 24×24 premultiplied BGRA) dari tools/icongen.
 const TB_ICONS: &[u8] = include_bytes!("../assets/icons/toolbar24.bin");
 
-/// Bangun ImageList 24x24 ARGB dari blob BGRA (alpha penuh; antialiased).
-unsafe fn build_toolbar_imagelist() -> HIMAGELIST {
+fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+/// Bangun ImageList 24x24 ARGB dari blob BGRA. Ikon Lucide monokrom hitam;
+/// untuk tema gelap di-tint jadi abu terang (premultiplied) agar terlihat.
+unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
     const N: i32 = 11;
     const SZ: i32 = 24;
     let stride = (SZ * SZ * 4) as usize;
@@ -1110,11 +1148,20 @@ unsafe fn build_toolbar_imagelist() -> HIMAGELIST {
     bmi.bmiHeader.biBitCount = 32;
 
     for i in 0..N as usize {
-        let src = &TB_ICONS[i * stride..(i + 1) * stride];
+        let mut buf = TB_ICONS[i * stride..(i + 1) * stride].to_vec();
+        if dark {
+            for px in buf.chunks_exact_mut(4) {
+                let a = px[3] as u32;
+                let v = (0xDC * a / 255) as u8; // premultiplied light-gray
+                px[0] = v;
+                px[1] = v;
+                px[2] = v;
+            }
+        }
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         if let Ok(hbmp) = CreateDIBSection(Some(screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
             if !bits.is_null() {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), bits as *mut u8, stride);
+                std::ptr::copy_nonoverlapping(buf.as_ptr(), bits as *mut u8, stride);
             }
             ImageList_Add(himl, hbmp, None);
             let _ = DeleteObject(hbmp.into());
@@ -1122,6 +1169,49 @@ unsafe fn build_toolbar_imagelist() -> HIMAGELIST {
     }
     ReleaseDC(None, screen);
     himl
+}
+
+/// Terapkan tema aktif (plan §12): title bar gelap, warna ListView/TreeView,
+/// dan ikon toolbar sesuai tema. Chrome klasik (menu/toolbar/status) tetap
+/// warna sistem (keterbatasan Win32 tanpa owner-draw penuh).
+unsafe fn apply_theme(hwnd: HWND) {
+    let dark = crate::theme::effective_dark(crate::settings::get().theme);
+
+    // Title bar.
+    let flag = windows::core::BOOL(dark as i32);
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &flag as *const _ as *const core::ffi::c_void,
+        std::mem::size_of::<windows::core::BOOL>() as u32,
+    );
+
+    let (bg, txt) = if dark {
+        (rgb(32, 32, 32), rgb(230, 230, 230))
+    } else {
+        (rgb(255, 255, 255), rgb(0, 0, 0))
+    };
+    let sub = if dark { w!("DarkMode_Explorer") } else { w!("Explorer") };
+
+    if let Some(lv) = state::load_hwnd(&state::LIST_HWND) {
+        let _ = SetWindowTheme(lv, sub, PCWSTR::null());
+        SendMessageW(lv, LVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
+        SendMessageW(lv, LVM_SETTEXTBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
+        SendMessageW(lv, LVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt.0 as isize)));
+        let _ = InvalidateRect(Some(lv), None, true);
+    }
+    if let Some(tv) = state::load_hwnd(&state::TREE_HWND) {
+        let _ = SetWindowTheme(tv, sub, PCWSTR::null());
+        SendMessageW(tv, TVM_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(bg.0 as isize)));
+        SendMessageW(tv, TVM_SETTEXTCOLOR, Some(WPARAM(0)), Some(LPARAM(txt.0 as isize)));
+        let _ = InvalidateRect(Some(tv), None, true);
+    }
+    if let Some(tb) = state::load_hwnd(&state::TOOLBAR_HWND) {
+        let himl = build_toolbar_imagelist(dark);
+        SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
+        let _ = InvalidateRect(Some(tb), None, true);
+    }
+    let _ = InvalidateRect(Some(hwnd), None, true);
 }
 
 // ============================ Tray ============================

@@ -11,9 +11,11 @@ pub mod gui;
 pub mod ipc_server;
 pub mod progress;
 pub mod scheduler;
+pub mod settings;
 pub mod single_instance;
 pub mod state;
 pub mod store;
+pub mod theme;
 
 use std::path::PathBuf;
 
@@ -62,7 +64,20 @@ pub fn run() {
         .enable_all()
         .build()
         .expect("gagal membangun runtime tokio");
-    let engine = engine::EngineHandle::new(rt.handle().clone(), default_download_dir(), gui::make_sink());
+    // Muat pengaturan persist & terapkan.
+    let cfg = settings::load();
+    let dl_dir = cfg
+        .download_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_download_dir);
+    let _ = std::fs::create_dir_all(&dl_dir);
+    let engine = engine::EngineHandle::new(rt.handle().clone(), dl_dir, gui::make_sink());
+    engine.set_queue_max(cfg.queue_max.max(1));
+    engine.set_global_limit(cfg.global_limit_kbps.saturating_mul(1024));
+    if cfg.autostart != autostart::is_enabled() {
+        autostart::set(cfg.autostart);
+    }
     gui::set_engine(engine.clone());
     scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)
 

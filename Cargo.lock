@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "adm-core",
  "adm-ipc",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

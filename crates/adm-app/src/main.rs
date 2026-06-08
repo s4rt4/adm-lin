@@ -1,7 +1,7 @@
 //! adm-app — binary tipis; semua orkestrasi ada di pustaka (`adm_app::run`).
 //
-// Subsystem masih "console" (lihat log engine/pipe saat WM2). Akan diganti
-// `#![windows_subsystem = "windows"]` di WM7.
+// Release: GUI tanpa console. Debug: tetap console agar log engine/pipe terlihat.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
     adm_app::run();
