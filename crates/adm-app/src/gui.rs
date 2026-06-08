@@ -259,6 +259,8 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     .unwrap_or_default();
     SendMessageW(tb, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
     SendMessageW(tb, TB_SETEXTENDEDSTYLE, Some(WPARAM(0)), Some(LPARAM(TBSTYLE_EX_MIXEDBUTTONS as isize)));
+    let himl = build_toolbar_imagelist();
+    SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
     add_toolbar_buttons(tb);
     SendMessageW(tb, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
     state::store_hwnd(&state::TOOLBAR_HWND, tb);
@@ -438,7 +440,7 @@ unsafe fn popup(bar: HMENU, sub: HMENU, text: PCWSTR) {
 
 // ============================ Toolbar ============================
 
-fn mkbtn(buttons: &mut Vec<TBBUTTON>, id: usize, label: &str, dropdown: bool) {
+fn mkbtn(buttons: &mut Vec<TBBUTTON>, id: usize, label: &str, icon: i32, dropdown: bool) {
     let mut wide: Vec<u16> = label.encode_utf16().collect();
     wide.push(0);
     let ptr = Box::leak(wide.into_boxed_slice()).as_ptr() as isize;
@@ -447,7 +449,7 @@ fn mkbtn(buttons: &mut Vec<TBBUTTON>, id: usize, label: &str, dropdown: bool) {
         style |= BTNS_WHOLEDROPDOWN;
     }
     buttons.push(TBBUTTON {
-        iBitmap: -2, // I_IMAGENONE
+        iBitmap: icon,
         idCommand: id as i32,
         fsState: TBSTATE_ENABLED as u8,
         fsStyle: style as u8,
@@ -471,20 +473,20 @@ fn mksep(buttons: &mut Vec<TBBUTTON>) {
 
 unsafe fn add_toolbar_buttons(tb: HWND) {
     let mut buttons: Vec<TBBUTTON> = Vec::new();
-    mkbtn(&mut buttons, ID_ADD, "Add URL", false);
-    mkbtn(&mut buttons, ID_RESUME, "Resume", false);
-    mkbtn(&mut buttons, ID_STOP, "Stop", false);
-    mkbtn(&mut buttons, ID_STOP_ALL, "Stop All", false);
-    mkbtn(&mut buttons, ID_DELETE, "Delete", false);
-    mkbtn(&mut buttons, ID_DELETE_COMPLETED, "Delete Co...", false);
+    mkbtn(&mut buttons, ID_ADD, "Add URL", 0, false);
+    mkbtn(&mut buttons, ID_RESUME, "Resume", 1, false);
+    mkbtn(&mut buttons, ID_STOP, "Stop", 2, false);
+    mkbtn(&mut buttons, ID_STOP_ALL, "Stop All", 3, false);
+    mkbtn(&mut buttons, ID_DELETE, "Delete", 4, false);
+    mkbtn(&mut buttons, ID_DELETE_COMPLETED, "Delete Co...", 5, false);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_OPTIONS, "Options", false);
-    mkbtn(&mut buttons, ID_SCHEDULER, "Scheduler", false);
+    mkbtn(&mut buttons, ID_OPTIONS, "Options", 6, false);
+    mkbtn(&mut buttons, ID_SCHEDULER, "Scheduler", 7, false);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_START_QUEUE, "Start Qu...", true);
-    mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Qu...", true);
+    mkbtn(&mut buttons, ID_START_QUEUE, "Start Qu...", 8, true);
+    mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Qu...", 9, true);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_TELL_FRIEND, "Tell a Fri...", false);
+    mkbtn(&mut buttons, ID_TELL_FRIEND, "Tell a Fri...", 10, false);
 
     SendMessageW(
         tb,
@@ -931,6 +933,154 @@ fn fmt_eta(secs: Option<u64>) -> String {
         Some(s) if s >= 60 => format!("{} min", s / 60),
         Some(s) => format!("{s} sec"),
     }
+}
+
+// ============================ Toolbar icons (GDI) ============================
+
+fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
+    COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+const GREEN: (u8, u8, u8) = (40, 160, 70);
+const DGREEN: (u8, u8, u8) = (59, 91, 67);
+const RED: (u8, u8, u8) = (210, 60, 55);
+const GOLD: (u8, u8, u8) = (217, 180, 4);
+const GRAY: (u8, u8, u8) = (96, 96, 100);
+const BLUE: (u8, u8, u8) = (70, 130, 180);
+const WHITE: (u8, u8, u8) = (255, 255, 255);
+
+unsafe fn frect(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: (u8, u8, u8)) {
+    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
+    let rc = RECT { left: l, top: t, right: r, bottom: b };
+    FillRect(dc, &rc, br);
+    let _ = DeleteObject(br.into());
+}
+
+unsafe fn fellipse(dc: HDC, l: i32, t: i32, r: i32, b: i32, c: (u8, u8, u8)) {
+    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
+    let pen = CreatePen(PS_SOLID, 1, rgb(c.0, c.1, c.2));
+    let ob = SelectObject(dc, br.into());
+    let op = SelectObject(dc, pen.into());
+    let _ = Ellipse(dc, l, t, r, b);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    let _ = DeleteObject(br.into());
+    let _ = DeleteObject(pen.into());
+}
+
+unsafe fn line(dc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, w: i32, c: (u8, u8, u8)) {
+    let pen = CreatePen(PS_SOLID, w, rgb(c.0, c.1, c.2));
+    let op = SelectObject(dc, pen.into());
+    let _ = MoveToEx(dc, x1, y1, None);
+    let _ = LineTo(dc, x2, y2);
+    SelectObject(dc, op);
+    let _ = DeleteObject(pen.into());
+}
+
+unsafe fn tri(dc: HDC, pts: [(i32, i32); 3], c: (u8, u8, u8)) {
+    let p: [POINT; 3] = [
+        POINT { x: pts[0].0, y: pts[0].1 },
+        POINT { x: pts[1].0, y: pts[1].1 },
+        POINT { x: pts[2].0, y: pts[2].1 },
+    ];
+    let br = CreateSolidBrush(rgb(c.0, c.1, c.2));
+    let pen = CreatePen(PS_SOLID, 1, rgb(c.0, c.1, c.2));
+    let ob = SelectObject(dc, br.into());
+    let op = SelectObject(dc, pen.into());
+    let _ = Polygon(dc, &p);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    let _ = DeleteObject(br.into());
+    let _ = DeleteObject(pen.into());
+}
+
+unsafe fn draw_icon(dc: HDC, idx: i32) {
+    match idx {
+        0 => {
+            // Add URL: lingkaran hijau + plus putih.
+            fellipse(dc, 2, 2, 22, 22, GREEN);
+            frect(dc, 10, 6, 14, 18, WHITE);
+            frect(dc, 6, 10, 18, 14, WHITE);
+        }
+        1 => tri(dc, [(7, 5), (7, 19), (19, 12)], GREEN), // Resume: play
+        2 => frect(dc, 5, 5, 19, 19, RED),                // Stop
+        3 => {
+            // Stop All: kotak merah + garis putih bertumpuk.
+            frect(dc, 4, 5, 20, 19, RED);
+            frect(dc, 7, 9, 17, 10, WHITE);
+            frect(dc, 7, 13, 17, 14, WHITE);
+        }
+        4 => {
+            // Delete: X merah tebal.
+            line(dc, 6, 6, 18, 18, 3, RED);
+            line(dc, 18, 6, 6, 18, 3, RED);
+        }
+        5 => {
+            // Delete Completed: X merah kecil + centang emas.
+            line(dc, 5, 6, 13, 14, 2, RED);
+            line(dc, 13, 6, 5, 14, 2, RED);
+            line(dc, 13, 16, 16, 20, 2, GOLD);
+            line(dc, 16, 20, 22, 11, 2, GOLD);
+        }
+        6 => {
+            // Options: roda gigi (gear).
+            frect(dc, 11, 1, 13, 5, GRAY);
+            frect(dc, 11, 19, 13, 23, GRAY);
+            frect(dc, 1, 11, 5, 13, GRAY);
+            frect(dc, 19, 11, 23, 13, GRAY);
+            fellipse(dc, 4, 4, 20, 20, GRAY);
+            fellipse(dc, 9, 9, 15, 15, WHITE);
+        }
+        7 => {
+            // Scheduler: jam.
+            fellipse(dc, 2, 2, 22, 22, GRAY);
+            fellipse(dc, 4, 4, 20, 20, WHITE);
+            line(dc, 12, 12, 12, 6, 2, GRAY);
+            line(dc, 12, 12, 16, 14, 2, GRAY);
+        }
+        8 => {
+            // Start Queue: play + bar.
+            tri(dc, [(6, 5), (6, 19), (16, 12)], GREEN);
+            frect(dc, 17, 5, 21, 19, DGREEN);
+        }
+        9 => {
+            // Stop Queue: kotak + bar.
+            frect(dc, 5, 5, 15, 19, RED);
+            frect(dc, 17, 5, 21, 19, RED);
+        }
+        10 => {
+            // Tell a Friend: amplop biru.
+            frect(dc, 3, 7, 21, 18, BLUE);
+            line(dc, 3, 7, 12, 13, 1, WHITE);
+            line(dc, 21, 7, 12, 13, 1, WHITE);
+        }
+        _ => {}
+    }
+}
+
+/// Bangun ImageList 24x24 berisi 11 ikon toolbar (GDI, masking magenta).
+unsafe fn build_toolbar_imagelist() -> HIMAGELIST {
+    const N: i32 = 11;
+    const SZ: i32 = 24;
+    let key = rgb(255, 0, 255);
+    let himl = ImageList_Create(SZ, SZ, ILC_COLOR24 | ILC_MASK, N, 0);
+    let screen = GetDC(None);
+    let dc = CreateCompatibleDC(Some(screen));
+    for idx in 0..N {
+        let bmp = CreateCompatibleBitmap(screen, SZ, SZ);
+        let old = SelectObject(dc, bmp.into());
+        let kb = CreateSolidBrush(key);
+        let rc = RECT { left: 0, top: 0, right: SZ, bottom: SZ };
+        FillRect(dc, &rc, kb);
+        let _ = DeleteObject(kb.into());
+        draw_icon(dc, idx);
+        SelectObject(dc, old);
+        ImageList_AddMasked(himl, bmp, key);
+        let _ = DeleteObject(bmp.into());
+    }
+    let _ = DeleteDC(dc);
+    ReleaseDC(None, screen);
+    himl
 }
 
 // ============================ Tray ============================
