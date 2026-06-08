@@ -3,8 +3,8 @@
 
 use crate::engine::{EngineEvent, EngineHandle, EventSink};
 use crate::{autostart, dialogs, state, store};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
@@ -19,6 +19,19 @@ static ENGINE: OnceLock<EngineHandle> = OnceLock::new();
 static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// HMENU submenu Theme (untuk radio-check).
 static THEME_MENU: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Tema gelap aktif (dibaca WndProc untuk custom-draw).
+static DARK: AtomicBool = AtomicBool::new(false);
+static STATUS_TEXT: Mutex<String> = Mutex::new(String::new());
+/// HMENU 6 popup menu utama (Tasks/File/Downloads/View/Help/About).
+static MENUS: Mutex<[isize; 6]> = Mutex::new([0; 6]);
+
+// Palet tema gelap dari logo (plan §12).
+const DARK_BG: (u8, u8, u8) = (26, 38, 32); // #1A2620
+const DARK_SURFACE: (u8, u8, u8) = (36, 52, 48); // #243430
+const DARK_TEXT: (u8, u8, u8) = (230, 236, 232); // #E6ECE8
+
+// Tombol menu-strip (pengganti menu bar agar bisa gelap).
+const ID_MENU_BASE: usize = 0x1A0; // ID_MENU_BASE+0..5
 
 // Kode filter (lParam node tree).
 const F_ALL: u8 = 0;
@@ -195,7 +208,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
         };
         let _ = RegisterClassW(&wc);
 
-        let menu = build_menu();
+        build_menus();
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
@@ -206,7 +219,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             980,
             600,
             None,
-            Some(menu),
+            None,
             Some(instance),
             None,
         )?;
@@ -285,8 +298,48 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_NOTIFY => {
+                let hdr = &*(lparam.0 as *const NMHDR);
+                let from = Some(hdr.hwndFrom);
+                if DARK.load(Ordering::SeqCst)
+                    && hdr.code == NM_CUSTOMDRAW
+                    && (from == state::load_hwnd(&state::TOOLBAR_HWND)
+                        || from == state::load_hwnd(&state::MENUSTRIP_HWND))
+                {
+                    return toolbar_customdraw(lparam);
+                }
                 handle_notify(hwnd, lparam);
                 LRESULT(0)
+            }
+            WM_ERASEBKGND => {
+                if DARK.load(Ordering::SeqCst) {
+                    let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                    let mut rc = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                    let br = CreateSolidBrush(rgb(DARK_BG.0, DARK_BG.1, DARK_BG.2));
+                    FillRect(hdc, &rc, br);
+                    let _ = DeleteObject(br.into());
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
+            WM_DRAWITEM => {
+                let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                if Some(dis.hwndItem) == state::load_hwnd(&state::STATUS_HWND) {
+                    let br = CreateSolidBrush(rgb(DARK_SURFACE.0, DARK_SURFACE.1, DARK_SURFACE.2));
+                    FillRect(dis.hDC, &dis.rcItem, br);
+                    let _ = DeleteObject(br.into());
+                    SetBkMode(dis.hDC, TRANSPARENT);
+                    SetTextColor(dis.hDC, rgb(DARK_TEXT.0, DARK_TEXT.1, DARK_TEXT.2));
+                    let text = STATUS_TEXT.lock().unwrap().clone();
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    let mut rc = dis.rcItem;
+                    rc.left += 6;
+                    DrawTextW(dis.hDC, &mut wide, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
             }
             WM_COMMAND => {
                 handle_command(hwnd, wparam.0 & 0xFFFF);
@@ -300,12 +353,34 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 // ============================ Layout ============================
 
 unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
+    // Menu strip (pengganti menu bar — bisa di-dark-kan via custom-draw).
+    let ms = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("ToolbarWindow32"),
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBSTYLE_FLAT | TBSTYLE_LIST | (CCS_NODIVIDER | CCS_NORESIZE | CCS_NOPARENTALIGN) as u32),
+        0, 0, 0, 0,
+        Some(hwnd),
+        None,
+        Some(instance),
+        None,
+    )
+    .unwrap_or_default();
+    SendMessageW(ms, TB_BUTTONSTRUCTSIZE, Some(WPARAM(std::mem::size_of::<TBBUTTON>())), Some(LPARAM(0)));
+    let mut mb: Vec<TBBUTTON> = Vec::new();
+    for (i, label) in ["Tasks", "File", "Downloads", "View", "Help", "About"].iter().enumerate() {
+        mkbtn(&mut mb, ID_MENU_BASE + i, label, -2, false);
+    }
+    SendMessageW(ms, TB_ADDBUTTONSW, Some(WPARAM(mb.len())), Some(LPARAM(mb.as_ptr() as isize)));
+    SendMessageW(ms, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
+    state::store_hwnd(&state::MENUSTRIP_HWND, ms);
+
     // Toolbar.
     let tb = CreateWindowExW(
         WINDOW_EX_STYLE::default(),
         w!("ToolbarWindow32"),
         PCWSTR::null(),
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | CCS_TOP as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | (CCS_NODIVIDER | CCS_NORESIZE | CCS_NOPARENTALIGN) as u32),
         0, 0, 0, 0,
         Some(hwnd),
         None,
@@ -377,21 +452,31 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     state::store_hwnd(&state::STATUS_HWND, sb);
 }
 
+unsafe fn tb_height(tb: HWND) -> i32 {
+    let s = SendMessageW(tb, TB_GETBUTTONSIZE, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    (((s >> 16) & 0xFFFF) as i32) + 6
+}
+
 unsafe fn layout(hwnd: HWND) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
 
+    let ms = state::load_hwnd(&state::MENUSTRIP_HWND);
     let tb = state::load_hwnd(&state::TOOLBAR_HWND);
     let sb = state::load_hwnd(&state::STATUS_HWND);
     let tv = state::load_hwnd(&state::TREE_HWND);
     let lv = state::load_hwnd(&state::LIST_HWND);
 
     let mut top = 0;
+    if let Some(ms) = ms {
+        let h = tb_height(ms);
+        let _ = MoveWindow(ms, 0, top, rc.right, h, true);
+        top += h;
+    }
     if let Some(tb) = tb {
-        SendMessageW(tb, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
-        let mut tr = RECT::default();
-        let _ = GetWindowRect(tb, &mut tr);
-        top = tr.bottom - tr.top;
+        let h = tb_height(tb);
+        let _ = MoveWindow(tb, 0, top, rc.right, h, true);
+        top += h;
     }
     let mut bottom = rc.bottom;
     if let Some(sb) = sb {
@@ -417,9 +502,7 @@ unsafe fn layout(hwnd: HWND) {
 
 // ============================ Menu ============================
 
-unsafe fn build_menu() -> HMENU {
-    let menu = CreateMenu().unwrap_or_default();
-
+unsafe fn build_menus() {
     let tasks = CreatePopupMenu().unwrap();
     append(tasks, ID_ADD, w!("Add new download...\tCtrl+N"));
     append(tasks, ID_ADD_BATCH, w!("Add batch download..."));
@@ -431,14 +514,12 @@ unsafe fn build_menu() -> HMENU {
     append(tasks, ID_IMPORT, w!("Import..."));
     sep(tasks);
     append(tasks, ID_EXIT, w!("Exit\tCtrl+Q"));
-    popup(menu, tasks, w!("Tasks"));
 
     let file = CreatePopupMenu().unwrap();
     append(file, ID_STOP, w!("Stop Download"));
     append(file, ID_REMOVE, w!("Remove"));
     append(file, ID_DOWNLOAD_NOW, w!("Download Now"));
     append(file, ID_REDOWNLOAD, w!("Redownload"));
-    popup(menu, file, w!("File"));
 
     let dl = CreatePopupMenu().unwrap();
     append(dl, ID_PAUSE_ALL, w!("Pause All"));
@@ -461,7 +542,6 @@ unsafe fn build_menu() -> HMENU {
     popup(dl, sl, w!("Speed Limiter"));
     sep(dl);
     append(dl, ID_OPTIONS, w!("Options..."));
-    popup(menu, dl, w!("Downloads"));
 
     let view = CreatePopupMenu().unwrap();
     append(view, ID_HIDE_CATEGORIES, w!("Hide categories"));
@@ -478,18 +558,22 @@ unsafe fn build_menu() -> HMENU {
     popup(view, theme, w!("Theme"));
     append(view, ID_FONT, w!("Font..."));
     append(view, ID_LANGUAGE, w!("Language"));
-    popup(menu, view, w!("View"));
 
     let help = CreatePopupMenu().unwrap();
     append(help, ID_HELP, w!("Help contents"));
     append(help, ID_CHECK_UPDATES, w!("Check for updates..."));
-    popup(menu, help, w!("Help"));
 
     let about = CreatePopupMenu().unwrap();
     append(about, ID_ABOUT, w!("About ADM"));
-    popup(menu, about, w!("About"));
 
-    menu
+    *MENUS.lock().unwrap() = [
+        tasks.0 as isize,
+        file.0 as isize,
+        dl.0 as isize,
+        view.0 as isize,
+        help.0 as isize,
+        about.0 as isize,
+    ];
 }
 
 unsafe fn append(menu: HMENU, id: usize, text: PCWSTR) {
@@ -855,8 +939,24 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         }
         ID_TRAY_EXIT => request_exit(hwnd),
         m if (ID_MOVE_BASE..ID_MOVE_BASE + 6).contains(&m) => do_move(hwnd, m - ID_MOVE_BASE),
+        m if (ID_MENU_BASE..ID_MENU_BASE + 6).contains(&m) => open_menu(hwnd, m - ID_MENU_BASE),
         _ => {}
     }
+}
+
+unsafe fn open_menu(hwnd: HWND, idx: usize) {
+    let h = MENUS.lock().unwrap()[idx];
+    if h == 0 {
+        return;
+    }
+    let menu = HMENU(h as *mut core::ffi::c_void);
+    let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) else { return };
+    let mut wr = RECT::default();
+    let _ = GetWindowRect(ms, &mut wr);
+    let mut br = RECT::default();
+    SendMessageW(ms, TB_GETRECT, Some(WPARAM(ID_MENU_BASE + idx)), Some(LPARAM(&mut br as *mut _ as isize)));
+    let _ = SetForegroundWindow(hwnd);
+    let _ = TrackPopupMenu(menu, TPM_LEFTALIGN, wr.left + br.left, wr.top + br.bottom, Some(0), hwnd, None);
 }
 
 unsafe fn do_move(hwnd: HWND, idx: usize) {
@@ -994,11 +1094,7 @@ unsafe fn refresh_ui(hwnd: HWND) {
     }
     let total = store::len();
     let active = store::active_count();
-    // Status bar.
-    if let Some(sb) = state::load_hwnd(&state::STATUS_HWND) {
-        let text = HSTRING::from(format!("{total} unduhan — {active} aktif"));
-        SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0)), Some(LPARAM(text.as_ptr() as isize)));
-    }
+    set_status_bar(&format!("{total} unduhan — {active} aktif"));
     // Judul.
     let title = if active == 0 {
         "Alpha Download Manager".to_string()
@@ -1011,6 +1107,26 @@ unsafe fn refresh_ui(hwnd: HWND) {
     // Dialog "Download complete" untuk unduhan yang baru selesai (§9.14).
     for row in store::take_newly_completed() {
         crate::progress::show_complete(hwnd, &row);
+    }
+}
+
+/// Set teks status bar; pada tema gelap pakai owner-draw agar teks terbaca.
+fn set_status_bar(text: &str) {
+    *STATUS_TEXT.lock().unwrap() = text.to_string();
+    let Some(sb) = state::load_hwnd(&state::STATUS_HWND) else { return };
+    let dark = DARK.load(Ordering::SeqCst);
+    unsafe {
+        if dark {
+            let c = rgb(DARK_SURFACE.0, DARK_SURFACE.1, DARK_SURFACE.2);
+            SendMessageW(sb, SB_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(c.0 as isize)));
+            // part 0 owner-draw (SBT_OWNERDRAW = 0x1000) → digambar di WM_DRAWITEM.
+            SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0x1000)), Some(LPARAM(0)));
+        } else {
+            SendMessageW(sb, SB_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(CLR_DEFAULT as isize)));
+            let h = HSTRING::from(text);
+            SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0)), Some(LPARAM(h.as_ptr() as isize)));
+        }
+        let _ = InvalidateRect(Some(sb), None, true);
     }
 }
 
@@ -1132,6 +1248,23 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF((r as u32) | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
+/// Custom-draw toolbar/menu-strip untuk tema gelap (latar surface + teks terang).
+unsafe fn toolbar_customdraw(lparam: LPARAM) -> LRESULT {
+    let cd = &mut *(lparam.0 as *mut NMTBCUSTOMDRAW);
+    let stage = cd.nmcd.dwDrawStage;
+    if stage == CDDS_PREPAINT {
+        let br = CreateSolidBrush(rgb(DARK_SURFACE.0, DARK_SURFACE.1, DARK_SURFACE.2));
+        FillRect(cd.nmcd.hdc, &cd.nmcd.rc, br);
+        let _ = DeleteObject(br.into());
+        LRESULT(CDRF_NOTIFYITEMDRAW as isize)
+    } else if stage == CDDS_ITEMPREPAINT {
+        cd.clrText = rgb(DARK_TEXT.0, DARK_TEXT.1, DARK_TEXT.2);
+        LRESULT(TBCDRF_USECDCOLORS as isize)
+    } else {
+        LRESULT(CDRF_DODEFAULT as isize)
+    }
+}
+
 /// Bangun ImageList 24x24 ARGB dari blob BGRA. Ikon Lucide monokrom hitam;
 /// untuk tema gelap di-tint jadi abu terang (premultiplied) agar terlihat.
 unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
@@ -1177,6 +1310,10 @@ unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
 /// warna sistem (keterbatasan Win32 tanpa owner-draw penuh).
 unsafe fn apply_theme(hwnd: HWND) {
     let dark = crate::theme::effective_dark(crate::settings::get().theme);
+    DARK.store(dark, Ordering::SeqCst);
+
+    // Popup menu gelap (best-effort via uxtheme; abaikan bila gagal).
+    crate::theme::set_dark_menus(dark);
 
     // Title bar.
     let flag = windows::core::BOOL(dark as i32);
@@ -1188,7 +1325,7 @@ unsafe fn apply_theme(hwnd: HWND) {
     );
 
     let (bg, txt) = if dark {
-        (rgb(32, 32, 32), rgb(230, 230, 230))
+        (rgb(DARK_BG.0, DARK_BG.1, DARK_BG.2), rgb(DARK_TEXT.0, DARK_TEXT.1, DARK_TEXT.2))
     } else {
         (rgb(255, 255, 255), rgb(0, 0, 0))
     };
@@ -1212,6 +1349,12 @@ unsafe fn apply_theme(hwnd: HWND) {
         SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
         let _ = InvalidateRect(Some(tb), None, true);
     }
+    if let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) {
+        let _ = InvalidateRect(Some(ms), None, true);
+    }
+    // Status bar: warna + (gelap = owner-draw teks).
+    let cur = STATUS_TEXT.lock().unwrap().clone();
+    set_status_bar(&cur);
     let _ = InvalidateRect(Some(hwnd), None, true);
 }
 

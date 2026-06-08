@@ -12,6 +12,7 @@ pub const WM_PROGRESS: u32 = WM_APP + 2;
 pub const WM_ACTIVATE_APP: u32 = WM_APP + 3;
 
 pub static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+pub static MENUSTRIP_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static TOOLBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static TREE_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static LIST_HWND: AtomicIsize = AtomicIsize::new(0);
