@@ -1,0 +1,27 @@
+[package]
+name = "adm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ADM resident app: Win32 GUI + tray + in-process engine + pipe server."
+
+[[bin]]
+name = "adm-app"
+path = "src/main.rs"
+
+[dependencies]
+adm-core = { path = "../adm-core" }
+adm-ipc = { path = "../adm-ipc" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros"] }
+
+[dependencies.windows]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+]

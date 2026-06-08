@@ -1,0 +1,16 @@
+[package]
+name = "adm-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ADM native messaging host: browser stdio <-> adm-app Named Pipe."
+
+[[bin]]
+name = "adm-bridge"
+path = "src/main.rs"
+
+[dependencies]
+adm-ipc = { path = "../adm-ipc" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time"] }

@@ -1,0 +1,13 @@
+[package]
+name = "adm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portable download engine for ADM (shared Linux + Windows)."
+
+[lib]
+name = "adm_core"
+path = "src/lib.rs"
+
+[dependencies]

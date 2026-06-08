@@ -1,0 +1,8 @@
+# Normalisasi line-ending ke LF (proyek shared Linux + Windows).
+* text=auto eol=lf
+
+# Berkas biner.
+*.svg binary
+*.png binary
+*.ico binary
+*.manifest text eol=lf
