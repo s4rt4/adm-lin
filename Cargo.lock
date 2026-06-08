@@ -9,6 +9,9 @@ dependencies = [
  "adm-core",
  "adm-ipc",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "tiny_http",
  "tokio",
  "windows",
 ]
