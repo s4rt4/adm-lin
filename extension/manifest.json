@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Alpha Download Manager Integration",
+  "version": "0.1.0",
+  "description": "Tangkap unduhan browser dan kirim ke Alpha Download Manager (ADM).",
+  "permissions": ["downloads", "contextMenus", "storage", "nativeMessaging"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Alpha Download Manager"
+  }
+}
