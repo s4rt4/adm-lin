@@ -23,6 +23,10 @@ pub static STATUS_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Sidebar kategori terlihat (View ▸ Hide categories).
 pub static SIDEBAR_VISIBLE: AtomicBool = AtomicBool::new(true);
+/// Toolbar terlihat (View ▸ Toolbar).
+pub static TOOLBAR_VISIBLE: AtomicBool = AtomicBool::new(true);
+/// Ikon tray aktif (View ▸ ADM tray icon).
+pub static TRAY_VISIBLE: AtomicBool = AtomicBool::new(true);
 
 fn to_hwnd(v: isize) -> Option<HWND> {
     if v == 0 {

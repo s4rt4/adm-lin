@@ -486,6 +486,188 @@ extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
     }
 }
 
+// ============================ Customize columns ============================
+
+const C_OK: usize = 1;
+const C_CANCEL: usize = 2;
+const C_BASE: usize = 100;
+const C_CLASS: PCWSTR = w!("AdmColumnsDialog");
+static C_REG: AtomicBool = AtomicBool::new(false);
+static C_DONE: AtomicBool = AtomicBool::new(false);
+static C_RESULT: Mutex<Option<Vec<bool>>> = Mutex::new(None);
+static C_CHECKS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+/// Dialog pilih kolom (checkbox per kolom). Kolom 0 dikunci (selalu tampil).
+pub fn columns_dialog(parent: HWND, names: &[&str], current: &[bool]) -> Option<Vec<bool>> {
+    unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let instance: HINSTANCE = module.into();
+        if !C_REG.swap(true, Ordering::SeqCst) {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(columns_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void),
+                lpszClassName: C_CLASS,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+        }
+        C_DONE.store(false, Ordering::SeqCst);
+        *C_RESULT.lock().unwrap() = None;
+        C_CHECKS.lock().unwrap().clear();
+
+        let rows = names.len() as i32;
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: 300, bottom: 56 + rows * 26 + 56 };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let mut pr = RECT::default();
+        let _ = GetWindowRect(parent, &mut pr);
+        let x = pr.left + ((pr.right - pr.left) - dw) / 2;
+        let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
+
+        let Ok(dlg) = CreateWindowExW(
+            WS_EX_DLGMODALFRAME,
+            C_CLASS,
+            w!("Customize URL List"),
+            style,
+            x.max(0),
+            y.max(0),
+            dw,
+            dh,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        ) else {
+            return None;
+        };
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let mk = |class: PCWSTR, text: PCWSTR, st: WINDOW_STYLE, x, y, w, h, id| {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class,
+                text,
+                st | WS_CHILD | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                Some(dlg),
+                Some(HMENU(id as *mut core::ffi::c_void)),
+                Some(instance),
+                None,
+            )
+            .unwrap_or_default();
+            SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            hwnd
+        };
+
+        mk(w!("STATIC"), w!("Kolom yang ditampilkan:"), WINDOW_STYLE(0), 16, 12, 260, 18, 0);
+        let mut checks = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let nh = HSTRING::from(*name);
+            let cb = mk(
+                w!("BUTTON"),
+                PCWSTR(nh.as_ptr()),
+                WINDOW_STYLE(WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+                24,
+                36 + i as i32 * 26,
+                250,
+                22,
+                C_BASE + i,
+            );
+            let checked = current.get(i).copied().unwrap_or(true);
+            SendMessageW(cb, BM_SETCHECK, Some(WPARAM(if checked { 1 } else { 0 })), Some(LPARAM(0)));
+            if i == 0 {
+                let _ = EnableWindow(cb, false); // "File Name" dikunci
+            }
+            checks.push(cb.0 as isize);
+        }
+        *C_CHECKS.lock().unwrap() = checks;
+
+        let by = 44 + rows * 26;
+        mk(
+            w!("BUTTON"),
+            w!("OK"),
+            WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32),
+            96,
+            by,
+            90,
+            28,
+            C_OK,
+        );
+        mk(
+            w!("BUTTON"),
+            w!("Cancel"),
+            WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+            194,
+            by,
+            90,
+            28,
+            C_CANCEL,
+        );
+
+        let _ = EnableWindow(parent, false);
+        let _ = ShowWindow(dlg, SW_SHOW);
+        let _ = SetForegroundWindow(dlg);
+
+        let mut msg = MSG::default();
+        while !C_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if !IsDialogMessageW(dlg, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        let _ = EnableWindow(parent, true);
+        let _ = SetForegroundWindow(parent);
+        if IsWindow(Some(dlg)).as_bool() {
+            let _ = DestroyWindow(dlg);
+        }
+        C_RESULT.lock().unwrap().take()
+    }
+}
+
+extern "system" fn columns_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                match id {
+                    C_OK => {
+                        let checks = C_CHECKS.lock().unwrap().clone();
+                        let vis: Vec<bool> = checks
+                            .iter()
+                            .map(|&h| {
+                                let cb = HWND(h as *mut core::ffi::c_void);
+                                SendMessageW(cb, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1
+                            })
+                            .collect();
+                        *C_RESULT.lock().unwrap() = Some(vis);
+                        C_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                        LRESULT(0)
+                    }
+                    C_CANCEL => {
+                        C_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                        LRESULT(0)
+                    }
+                    _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+            }
+            WM_CLOSE => {
+                C_DONE.store(true, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
 // ============================ Export / Import ============================
 
 /// Filter dialog file: UTF-16 dengan null pemisah ganda di akhir.

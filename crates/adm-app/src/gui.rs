@@ -541,9 +541,13 @@ unsafe fn layout(hwnd: HWND) {
         top += h;
     }
     if let Some(tb) = tb {
-        let h = tb_height(tb);
-        let _ = MoveWindow(tb, 0, top, rc.right, h, true);
-        top += h;
+        let tb_vis = state::TOOLBAR_VISIBLE.load(Ordering::SeqCst);
+        let _ = ShowWindow(tb, if tb_vis { SW_SHOW } else { SW_HIDE });
+        if tb_vis {
+            let h = tb_height(tb);
+            let _ = MoveWindow(tb, 0, top, rc.right, h, true);
+            top += h;
+        }
     }
     let mut bottom = rc.bottom;
     if let Some(sb) = sb {
@@ -730,18 +734,22 @@ unsafe fn populate_categories(tv: HWND) {
 
 // ============================ ListView ============================
 
+/// Definisi kolom ListView (judul, lebar default). Indeks = iSubItem.
+const COL_DEFS: [(&str, i32); 8] = [
+    ("File Name", 230),
+    ("Q", 28),
+    ("Size", 90),
+    ("Status", 100),
+    ("Time left", 90),
+    ("Transfer rate", 100),
+    ("Last Try", 110),
+    ("Description", 120),
+];
+/// Visibilitas kolom (View ▸ Customize URL List). Kolom 0 selalu tampil.
+static COL_VISIBLE: Mutex<[bool; 8]> = Mutex::new([true; 8]);
+
 unsafe fn add_list_columns(lv: HWND) {
-    let cols: [(&str, i32); 8] = [
-        ("File Name", 230),
-        ("Q", 28),
-        ("Size", 90),
-        ("Status", 100),
-        ("Time left", 90),
-        ("Transfer rate", 100),
-        ("Last Try", 110),
-        ("Description", 120),
-    ];
-    for (i, (title, width)) in cols.iter().enumerate() {
+    for (i, (title, width)) in COL_DEFS.iter().enumerate() {
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         wide.push(0);
         let mut col = LVCOLUMNW {
@@ -948,6 +956,28 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             state::SIDEBAR_VISIBLE.store(v, Ordering::SeqCst);
             layout(hwnd);
         }
+        ID_TOOLBAR => {
+            let v = !state::TOOLBAR_VISIBLE.load(Ordering::SeqCst);
+            state::TOOLBAR_VISIBLE.store(v, Ordering::SeqCst);
+            layout(hwnd);
+        }
+        ID_TRAY_ICON => {
+            let v = !state::TRAY_VISIBLE.load(Ordering::SeqCst);
+            state::TRAY_VISIBLE.store(v, Ordering::SeqCst);
+            if v {
+                add_tray_icon(hwnd);
+            } else {
+                remove_tray_icon(hwnd);
+            }
+        }
+        ID_ARRANGE => {
+            store::sort_by_name();
+            if let Some(lv) = state::load_hwnd(&state::LIST_HWND) {
+                SendMessageW(lv, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            refresh_ui(hwnd);
+        }
+        ID_CUSTOMIZE => do_customize_columns(hwnd),
         ID_THEME_DARK => set_theme(hwnd, crate::settings::THEME_DARK),
         ID_THEME_LIGHT => set_theme(hwnd, crate::settings::THEME_LIGHT),
         ID_THEME_SYSTEM => set_theme(hwnd, crate::settings::THEME_SYSTEM),
@@ -996,9 +1026,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
         }
-        ID_ARRANGE | ID_TOOLBAR | ID_TRAY_ICON | ID_CUSTOMIZE | ID_FONT | ID_LANGUAGE => {
-            info(hwnd, "Menyusul.")
-        }
+        ID_FONT | ID_LANGUAGE => info(hwnd, "Menyusul."),
         // Tray.
         ID_TRAY_SHOW => toggle_window(hwnd),
         ID_TRAY_AUTOSTART => {
@@ -1019,6 +1047,8 @@ unsafe fn open_menu(hwnd: HWND, idx: usize) {
     let menu = HMENU(h as *mut core::ffi::c_void);
     if idx == 1 {
         update_file_menu(menu); // menu "File" — item kondisional ikut status
+    } else if idx == 3 {
+        update_view_menu(menu); // menu "View" — checkmark visibilitas
     }
     let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) else { return };
     let mut wr = RECT::default();
@@ -1152,6 +1182,31 @@ unsafe fn do_import(hwnd: HWND) {
             }
             Err(e) => info(hwnd, &format!("Gagal membaca berkas: {e}")),
         }
+    }
+}
+
+/// View ▸ Customize URL List: pilih kolom yang tampil (lebar 0 = sembunyi).
+unsafe fn do_customize_columns(hwnd: HWND) {
+    let names: Vec<&str> = COL_DEFS.iter().map(|(n, _)| *n).collect();
+    let current = *COL_VISIBLE.lock().unwrap();
+    if let Some(vis) = crate::tasks::columns_dialog(hwnd, &names, &current) {
+        let mut arr = [true; 8];
+        for (i, v) in vis.iter().enumerate().take(8) {
+            arr[i] = *v;
+        }
+        arr[0] = true; // "File Name" selalu tampil
+        *COL_VISIBLE.lock().unwrap() = arr;
+        apply_column_widths();
+    }
+}
+
+/// Terapkan visibilitas kolom: lebar default bila tampil, 0 bila disembunyikan.
+unsafe fn apply_column_widths() {
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return };
+    let vis = *COL_VISIBLE.lock().unwrap();
+    for (i, (_, w)) in COL_DEFS.iter().enumerate() {
+        let width = if vis[i] { *w } else { 0 };
+        SendMessageW(lv, LVM_SETCOLUMNWIDTH, Some(WPARAM(i)), Some(LPARAM(width as isize)));
     }
 }
 
@@ -1300,6 +1355,18 @@ unsafe fn update_file_menu(menu: HMENU) {
     en(ID_REMOVE, status.is_some());
     en(ID_DOWNLOAD_NOW, can_resume);
     en(ID_REDOWNLOAD, can_redo);
+}
+
+/// Checkmark menu "View" sesuai status tampilan.
+unsafe fn update_view_menu(menu: HMENU) {
+    let chk = |id: usize, on: bool| {
+        let flag = if on { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = CheckMenuItem(menu, id as u32, (MF_BYCOMMAND | flag).0);
+    };
+    // "Hide categories" tercentang saat kategori disembunyikan.
+    chk(ID_HIDE_CATEGORIES, !state::SIDEBAR_VISIBLE.load(Ordering::SeqCst));
+    chk(ID_TOOLBAR, state::TOOLBAR_VISIBLE.load(Ordering::SeqCst));
+    chk(ID_TRAY_ICON, state::TRAY_VISIBLE.load(Ordering::SeqCst));
 }
 
 /// AppendMenu dengan kondisi enable (disabled = abu-abu).

@@ -73,6 +73,12 @@ pub fn len() -> usize {
     ROWS.lock().unwrap().len()
 }
 
+/// Urutkan daftar berdasarkan nama berkas (A→Z, case-insensitive). Dipakai
+/// View ▸ Arrange files.
+pub fn sort_by_name() {
+    ROWS.lock().unwrap().sort_by_key(|r| r.filename().to_lowercase());
+}
+
 pub fn id_at(index: usize) -> Option<u64> {
     ROWS.lock().unwrap().get(index).map(|r| r.id)
 }
