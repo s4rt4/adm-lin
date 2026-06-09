@@ -1187,9 +1187,11 @@ unsafe fn refresh_ui(hwnd: HWND) {
     let h = HSTRING::from(title);
     let _ = SetWindowTextW(hwnd, PCWSTR(h.as_ptr()));
 
-    // Dialog "Download complete" untuk unduhan yang baru selesai (§9.14).
+    // Unduhan baru selesai: tutup dialog status (tak diperlukan lagi), lalu
+    // tampilkan dialog "Download complete" (§9.14).
     let show_complete = crate::settings::get().show_complete_dialog;
     for row in store::take_newly_completed() {
+        crate::progress::close_for(row.id);
         if show_complete {
             crate::progress::show_complete(hwnd, &row);
         }

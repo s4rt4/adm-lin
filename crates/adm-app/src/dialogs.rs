@@ -117,10 +117,15 @@ pub fn add_dialog(
         DONE.store(false, Ordering::SeqCst);
         *RESULT.lock().unwrap() = None;
 
-        // Posisikan di tengah parent.
+        // Ukuran CLIENT diinginkan; window dibesarkan agar client = ini
+        // (kontrol kanan tak kepotong / mepet).
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rcsz = RECT { left: 0, top: 0, right: 568, bottom: 250 };
+        let _ = AdjustWindowRectEx(&mut rcsz, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rcsz.right - rcsz.left, rcsz.bottom - rcsz.top);
+
         let mut pr = RECT::default();
         let _ = GetWindowRect(parent, &mut pr);
-        let (dw, dh) = (560, 250);
         let x = pr.left + ((pr.right - pr.left) - dw) / 2;
         let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
 
@@ -128,7 +133,7 @@ pub fn add_dialog(
             WS_EX_DLGMODALFRAME,
             CLASS,
             w!("Download File Info"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             x.max(0),
             y.max(0),
             dw,

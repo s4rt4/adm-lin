@@ -20,9 +20,26 @@ static REG: AtomicBool = AtomicBool::new(false);
 
 const IDC_PAUSE: usize = 1;
 const IDC_CANCEL: usize = 2;
+const IDC_HIDE: usize = 3;
 const IDC_SL_CHECK: usize = 10;
 const IDC_SL_EDIT: usize = 11;
 const TIMER_ID: usize = 1;
+
+/// Registry dialog progres terbuka (id → HWND) untuk auto-tutup saat selesai.
+static OPEN_DIALOGS: Mutex<Vec<(u64, isize)>> = Mutex::new(Vec::new());
+
+/// Tutup dialog progres untuk unduhan `id` (dipanggil saat selesai).
+pub fn close_for(id: u64) {
+    let hwnds: Vec<isize> = {
+        let dlgs = OPEN_DIALOGS.lock().unwrap();
+        dlgs.iter().filter(|(i, _)| *i == id).map(|(_, h)| *h).collect()
+    };
+    for h in hwnds {
+        unsafe {
+            let _ = DestroyWindow(HWND(h as *mut core::ffi::c_void));
+        }
+    }
+}
 
 // Warna segmen (palet beragam) untuk porsi terunduh.
 const COLORS: [(u8, u8, u8); 6] = [
@@ -48,12 +65,16 @@ struct DlgData {
     lbl_resume: HWND,
     progress: HWND,
     segbar: HWND,
+    seg_caption: HWND,
     conn: HWND,
     btn_pause: HWND,
+    btn_hide: HWND,
+    btn_cancel: HWND,
     tab: HWND,
     tabs: [Vec<HWND>; 3],
     chk_limit: HWND,
     edit_limit: HWND,
+    details: bool,
 }
 
 unsafe fn gui_font() -> HGDIOBJ {
@@ -143,15 +164,18 @@ pub fn open(parent: HWND, id: u64) {
             .unwrap_or_else(|| "Download".into());
         let htitle = HSTRING::from(title);
 
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rcsz = RECT { left: 0, top: 0, right: 560, bottom: 470 };
+        let _ = AdjustWindowRectEx(&mut rcsz, style, false, WS_EX_DLGMODALFRAME);
         let dlg = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             PROGRESS_CLASS,
             PCWSTR(htitle.as_ptr()),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            560,
-            470,
+            rcsz.right - rcsz.left,
+            rcsz.bottom - rcsz.top,
             Some(parent),
             None,
             Some(instance),
@@ -199,7 +223,8 @@ pub fn open(parent: HWND, id: u64) {
         SendMessageW(progress, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(1000)));
         t1.push(progress);
 
-        t1.push(label(dlg, "Start positions and download progress by connections:", 20, 228, 400));
+        let seg_caption = label(dlg, "Start positions and download progress by connections:", 20, 228, 400);
+        t1.push(seg_caption);
         let segbar = CreateWindowExW(
             WS_EX_STATICEDGE,
             SEGBAR_CLASS,
@@ -270,8 +295,9 @@ pub fn open(parent: HWND, id: u64) {
         }
 
         // Tombol bawah.
-        let btn_pause = mk(dlg, w!("BUTTON"), w!("Pause"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 330, 420, 100, 28, IDC_PAUSE);
-        let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 440, 420, 100, 28, IDC_CANCEL);
+        let btn_hide = mk(dlg, w!("BUTTON"), w!("<< Hide details"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 20, 424, 130, 28, IDC_HIDE);
+        let btn_pause = mk(dlg, w!("BUTTON"), w!("Pause"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 330, 424, 100, 28, IDC_PAUSE);
+        let btn_cancel = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(BS_PUSHBUTTON as u32), 440, 424, 100, 28, IDC_CANCEL);
 
         let data = Box::new(DlgData {
             id,
@@ -283,14 +309,19 @@ pub fn open(parent: HWND, id: u64) {
             lbl_resume,
             progress,
             segbar,
+            seg_caption,
             conn,
             btn_pause,
+            btn_hide,
+            btn_cancel,
             tab,
             tabs: [t1, t2, t3],
             chk_limit,
             edit_limit,
+            details: true,
         });
         SetWindowLongPtrW(dlg, GWLP_USERDATA, Box::into_raw(data) as isize);
+        OPEN_DIALOGS.lock().unwrap().push((id, dlg.0 as isize));
 
         if let Some(r) = &row {
             set_text(lbl_url, &r.url);
@@ -317,6 +348,34 @@ unsafe fn show_tab(d: &DlgData, sel: usize) {
             let _ = ShowWindow(*h, cmd);
         }
     }
+}
+
+/// Tampilkan/sembunyikan area detail (segmen + tabel koneksi) & ubah ukuran.
+unsafe fn toggle_details(hwnd: HWND) {
+    let Some(d) = data_of(hwnd) else { return };
+    d.details = !d.details;
+    let cmd = if d.details { SW_SHOW } else { SW_HIDE };
+    let _ = ShowWindow(d.seg_caption, cmd);
+    let _ = ShowWindow(d.segbar, cmd);
+    let _ = ShowWindow(d.conn, cmd);
+
+    let txt: PCWSTR = if d.details {
+        w!("<< Hide details")
+    } else {
+        w!("Show details >>")
+    };
+    let _ = SetWindowTextW(d.btn_hide, txt);
+
+    let (tab_h, btn_y, client_h) = if d.details { (400, 424, 470) } else { (190, 214, 260) };
+    let _ = SetWindowPos(d.tab, None, 8, 8, 536, tab_h, SWP_NOZORDER);
+    let _ = MoveWindow(d.btn_hide, 20, btn_y, 130, 28, true);
+    let _ = MoveWindow(d.btn_pause, 330, btn_y, 100, 28, true);
+    let _ = MoveWindow(d.btn_cancel, 440, btn_y, 100, 28, true);
+
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let mut rc = RECT { left: 0, top: 0, right: 560, bottom: client_h };
+    let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+    let _ = SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER);
 }
 
 unsafe fn refresh(dlg: HWND) {
@@ -422,6 +481,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                             }
                             let _ = DestroyWindow(hwnd);
                         }
+                        IDC_HIDE => toggle_details(hwnd),
                         _ => {}
                     }
                 }
@@ -433,6 +493,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             WM_NCDESTROY => {
                 let _ = KillTimer(Some(hwnd), TIMER_ID);
+                OPEN_DIALOGS.lock().unwrap().retain(|(_, h)| *h != hwnd.0 as isize);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DlgData;
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
