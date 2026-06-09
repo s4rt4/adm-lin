@@ -974,7 +974,8 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             }
             refresh_ui(hwnd);
         }
-        ID_FIND | ID_FIND_NEXT => info(hwnd, "Find menyusul."),
+        ID_FIND => do_find(hwnd),
+        ID_FIND_NEXT => do_find_next(hwnd),
         ID_ADD_BATCH => do_batch(hwnd, String::new()),
         ID_ADD_BATCH_CLIP => {
             let clip = crate::tasks::read_clipboard_text().unwrap_or_default();
@@ -1152,6 +1153,60 @@ unsafe fn do_import(hwnd: HWND) {
             Err(e) => info(hwnd, &format!("Gagal membaca berkas: {e}")),
         }
     }
+}
+
+/// Kata kunci Find terakhir (dipakai Find Next).
+static FIND_QUERY: Mutex<String> = Mutex::new(String::new());
+
+/// Find: minta kata kunci, lalu cari dari atas.
+unsafe fn do_find(hwnd: HWND) {
+    let init = FIND_QUERY.lock().unwrap().clone();
+    if let Some(q) = crate::tasks::prompt_dialog(hwnd, "Find", "Cari berkas (nama):", &init) {
+        let q = q.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        *FIND_QUERY.lock().unwrap() = q;
+        find_from(hwnd, 0);
+    }
+}
+
+/// Find Next: lanjut dari item terpilih (atau minta kata kunci bila kosong).
+unsafe fn do_find_next(hwnd: HWND) {
+    if FIND_QUERY.lock().unwrap().is_empty() {
+        do_find(hwnd);
+        return;
+    }
+    let start = state::load_hwnd(&state::LIST_HWND)
+        .and_then(selected_index)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    find_from(hwnd, start);
+}
+
+/// Cari (case-insensitive, substring nama) mulai indeks `start`, melingkar.
+unsafe fn find_from(hwnd: HWND, start: i32) {
+    let q = FIND_QUERY.lock().unwrap().to_lowercase();
+    let Some(lv) = state::load_hwnd(&state::LIST_HWND) else { return };
+    let count = SendMessageW(lv, LVM_GETITEMCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0 as i32;
+    if count == 0 {
+        info(hwnd, "Daftar kosong.");
+        return;
+    }
+    for off in 0..count {
+        let i = (start + off).rem_euclid(count);
+        if let Some(id) = item_id(lv, i) {
+            if let Some(row) = store::get(id) {
+                if row.filename().to_lowercase().contains(&q) {
+                    select_item(lv, i);
+                    SendMessageW(lv, LVM_ENSUREVISIBLE, Some(WPARAM(i as usize)), Some(LPARAM(0)));
+                    let _ = SetFocus(Some(lv));
+                    return;
+                }
+            }
+        }
+    }
+    info(hwnd, &format!("Tidak ditemukan: {}", *FIND_QUERY.lock().unwrap()));
 }
 
 /// Redownload: unduh ulang item terpilih dari awal — hentikan bila aktif,

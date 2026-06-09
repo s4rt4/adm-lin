@@ -309,6 +309,183 @@ extern "system" fn batch_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPAR
     }
 }
 
+// ============================ Prompt satu baris ============================
+
+const P_OK: usize = 1;
+const P_CANCEL: usize = 2;
+const P_EDIT: usize = 100;
+const P_CLASS: PCWSTR = w!("AdmPromptDialog");
+static P_REG: AtomicBool = AtomicBool::new(false);
+static P_DONE: AtomicBool = AtomicBool::new(false);
+static P_RESULT: Mutex<Option<String>> = Mutex::new(None);
+static P_EDIT_HWND: Mutex<isize> = Mutex::new(0);
+
+/// Dialog input satu baris (mis. untuk Find). Mengembalikan teks bila OK.
+pub fn prompt_dialog(parent: HWND, title: &str, label: &str, initial: &str) -> Option<String> {
+    unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let instance: HINSTANCE = module.into();
+        if !P_REG.swap(true, Ordering::SeqCst) {
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(prompt_proc),
+                hInstance: instance,
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void),
+                lpszClassName: P_CLASS,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+        }
+        P_DONE.store(false, Ordering::SeqCst);
+        *P_RESULT.lock().unwrap() = None;
+
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: 380, bottom: 132 };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
+        let mut pr = RECT::default();
+        let _ = GetWindowRect(parent, &mut pr);
+        let x = pr.left + ((pr.right - pr.left) - dw) / 2;
+        let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
+
+        let th = HSTRING::from(title);
+        let Ok(dlg) = CreateWindowExW(
+            WS_EX_DLGMODALFRAME,
+            P_CLASS,
+            PCWSTR(th.as_ptr()),
+            style,
+            x.max(0),
+            y.max(0),
+            dw,
+            dh,
+            Some(parent),
+            None,
+            Some(instance),
+            None,
+        ) else {
+            return None;
+        };
+
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let mk = |class: PCWSTR, text: PCWSTR, st: WINDOW_STYLE, x, y, w, h, id| {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class,
+                text,
+                st | WS_CHILD | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                Some(dlg),
+                Some(HMENU(id as *mut core::ffi::c_void)),
+                Some(instance),
+                None,
+            )
+            .unwrap_or_default();
+            SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+            hwnd
+        };
+
+        let lh = HSTRING::from(label);
+        mk(w!("STATIC"), PCWSTR(lh.as_ptr()), WINDOW_STYLE(0), 16, 14, 348, 18, 0);
+        let edit = mk(
+            w!("EDIT"),
+            PCWSTR::null(),
+            WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32),
+            16,
+            36,
+            348,
+            24,
+            P_EDIT,
+        );
+        *P_EDIT_HWND.lock().unwrap() = edit.0 as isize;
+        if !initial.is_empty() {
+            let h = HSTRING::from(initial);
+            let _ = SetWindowTextW(edit, PCWSTR(h.as_ptr()));
+            SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
+        mk(
+            w!("BUTTON"),
+            w!("OK"),
+            WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32),
+            176,
+            74,
+            90,
+            28,
+            P_OK,
+        );
+        mk(
+            w!("BUTTON"),
+            w!("Cancel"),
+            WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+            274,
+            74,
+            90,
+            28,
+            P_CANCEL,
+        );
+
+        let _ = EnableWindow(parent, false);
+        let _ = ShowWindow(dlg, SW_SHOW);
+        let _ = SetForegroundWindow(dlg);
+        let _ = SetFocus(Some(edit));
+
+        let mut msg = MSG::default();
+        while !P_DONE.load(Ordering::SeqCst) && GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if !IsDialogMessageW(dlg, &msg).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        let _ = EnableWindow(parent, true);
+        let _ = SetForegroundWindow(parent);
+        if IsWindow(Some(dlg)).as_bool() {
+            let _ = DestroyWindow(dlg);
+        }
+        P_RESULT.lock().unwrap().take()
+    }
+}
+
+extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_COMMAND => {
+                let id = wparam.0 & 0xFFFF;
+                match id {
+                    P_OK => {
+                        let h = HWND(*P_EDIT_HWND.lock().unwrap() as *mut core::ffi::c_void);
+                        let len = GetWindowTextLengthW(h);
+                        let text = if len > 0 {
+                            let mut buf = vec![0u16; len as usize + 1];
+                            let n = GetWindowTextW(h, &mut buf);
+                            String::from_utf16_lossy(&buf[..n as usize])
+                        } else {
+                            String::new()
+                        };
+                        *P_RESULT.lock().unwrap() = Some(text);
+                        P_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                        LRESULT(0)
+                    }
+                    P_CANCEL => {
+                        P_DONE.store(true, Ordering::SeqCst);
+                        let _ = DestroyWindow(hwnd);
+                        LRESULT(0)
+                    }
+                    _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+            }
+            WM_CLOSE => {
+                P_DONE.store(true, Ordering::SeqCst);
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
 // ============================ Export / Import ============================
 
 /// Filter dialog file: UTF-16 dengan null pemisah ganda di akhir.
