@@ -568,7 +568,13 @@ pub fn show_complete(parent: HWND, row: &Row) {
         CMPL_DONE.store(false, Ordering::SeqCst);
         *CMPL_PATH.lock().unwrap() = row.output.to_string_lossy().into_owned();
 
-        let (dw, dh) = (520, 250);
+        // Ukuran CLIENT yang diinginkan; window dibesarkan agar client = ini.
+        let (cw, ch) = (520, 250);
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: cw, bottom: ch };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
+
         let mut pr = RECT::default();
         let _ = GetWindowRect(parent, &mut pr);
         let x = (pr.left + ((pr.right - pr.left) - dw) / 2).max(0);
@@ -578,7 +584,7 @@ pub fn show_complete(parent: HWND, row: &Row) {
             WS_EX_DLGMODALFRAME,
             CMPL_CLASS,
             w!("Download complete"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             x, y, dw, dh,
             Some(parent),
             None,
@@ -674,9 +680,7 @@ extern "system" fn cmpl_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                         let _ = DestroyWindow(hwnd);
                     }
                     IDB_OPENFOLDER => {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(format!("/select,{path}"))
-                            .spawn();
+                        crate::gui::open_folder(std::path::Path::new(&path));
                         CMPL_DONE.store(true, Ordering::SeqCst);
                         let _ = DestroyWindow(hwnd);
                     }

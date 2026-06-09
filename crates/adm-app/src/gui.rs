@@ -130,14 +130,22 @@ const ID_TRAY_EXIT: usize = 0x202;
 /// Ikon aplikasi (di-embed; dibuat dari logo.svg via tools/icongen).
 const APP_ICO: &[u8] = include_bytes!("../assets/adm.ico");
 
-/// Muat HICON dari .ico embedded pada ukuran terdekat.
-unsafe fn load_app_icon(cx: i32, cy: i32) -> HICON {
-    let off = LookupIconIdFromDirectoryEx(APP_ICO.as_ptr(), true, cx, cy, LR_DEFAULTCOLOR);
-    if off <= 0 {
-        return LoadIconW(None, IDI_APPLICATION).unwrap_or_default();
+/// Muat HICON dari .ico embedded pada ukuran terdekat. Entry 256px disimpan
+/// PNG (tak didukung CreateIconFromResourceEx) → coba ukuran lalu fallback 48/32.
+unsafe fn load_app_icon(cx: i32, _cy: i32) -> HICON {
+    for &sz in &[cx, 48, 32] {
+        let off = LookupIconIdFromDirectoryEx(APP_ICO.as_ptr(), true, sz, sz, LR_DEFAULTCOLOR);
+        if off <= 0 {
+            continue;
+        }
+        let data = &APP_ICO[off as usize..];
+        if let Ok(h) = CreateIconFromResourceEx(data, true, 0x0003_0000, sz, sz, LR_DEFAULTCOLOR) {
+            if !h.is_invalid() {
+                return h;
+            }
+        }
     }
-    let data = &APP_ICO[off as usize..];
-    CreateIconFromResourceEx(data, true, 0x0003_0000, cx, cy, LR_DEFAULTCOLOR).unwrap_or_default()
+    LoadIconW(None, IDI_APPLICATION).unwrap_or_default()
 }
 
 pub fn set_engine(engine: EngineHandle) {
@@ -201,7 +209,7 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: load_app_icon(256, 256),
+            hIcon: load_app_icon(64, 64),
             hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as *mut core::ffi::c_void),
             lpszClassName: class_name,
             ..Default::default()
@@ -227,9 +235,8 @@ pub fn run(start_hidden: bool) -> windows::core::Result<()> {
 
         // Ikon kecil & besar untuk taskbar/titlebar.
         let small = load_app_icon(GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
-        // ICON_BIG dipakai taskbar/Alt-Tab & di-scale shell — ambil 256px agar
-        // downscale tajam (tidak blur di DPI tinggi). Plan §15 bug ikon.
-        let big = load_app_icon(256, 256);
+        // ICON_BIG dipakai taskbar/Alt-Tab. 64px = BMP (256 disimpan PNG → gagal).
+        let big = load_app_icon(64, 64);
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_SMALL as usize)), Some(LPARAM(small.0 as isize)));
         SendMessageW(hwnd, WM_SETICON, Some(WPARAM(ICON_BIG as usize)), Some(LPARAM(big.0 as isize)));
 
@@ -1054,11 +1061,18 @@ unsafe fn open_selected(_hwnd: HWND, index: i32) {
 fn open_folder_selected() {
     if let Some(id) = selected_id() {
         if let Some(row) = store::get(id) {
-            let _ = std::process::Command::new("explorer")
-                .arg(format!("/select,{}", row.output.display()))
-                .spawn();
+            open_folder(&row.output);
         }
     }
+}
+
+/// Buka Explorer & sorot berkas. `raw_arg` agar `/select,"<path berspasi>"`
+/// tak diutip seluruhnya oleh Rust (penyebab explorer buka folder default).
+pub fn open_folder(path: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer.exe")
+        .raw_arg(format!("/select,\"{}\"", path.display()))
+        .spawn();
 }
 
 unsafe fn show_context_menu(hwnd: HWND) {
