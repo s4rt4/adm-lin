@@ -83,6 +83,9 @@ pub fn run() {
     if cfg.autostart != autostart::is_enabled() {
         autostart::set(cfg.autostart);
     }
+    // Pulihkan daftar unduhan yang persist; setel id engine agar tak bentrok.
+    let max_id = store::load();
+    engine.reserve_ids(max_id + 1);
     gui::set_engine(engine.clone());
     scheduler::start(engine.clone()); // timer pemicu start/stop queue (§9.15)
 

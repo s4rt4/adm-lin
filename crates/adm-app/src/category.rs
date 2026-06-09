@@ -1,7 +1,7 @@
 //! Kategori & auto-klasifikasi (plan §10). Ekstensi → kategori → subfolder
 //! di bawah folder unduhan (mis. `%USERPROFILE%\Downloads\Compressed`).
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Category {
     Compressed,
     Documents,

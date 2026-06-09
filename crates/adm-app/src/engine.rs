@@ -102,6 +102,12 @@ impl EngineHandle {
         self.active.lock().unwrap().len()
     }
 
+    /// Pastikan id berikutnya minimal `min_next` (dipakai setelah memulihkan
+    /// daftar unduhan dari disk agar id baru tak bentrok dengan yang dipulihkan).
+    pub fn reserve_ids(&self, min_next: u64) {
+        self.next_id.fetch_max(min_next, Ordering::SeqCst);
+    }
+
     /// Batas unduhan antrian yang berjalan bersamaan.
     pub fn set_queue_max(&self, max: usize) {
         self.queue.lock().unwrap().max = max.max(1);

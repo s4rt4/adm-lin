@@ -211,13 +211,16 @@ pub fn make_sink() -> EventSink {
         match ev {
             EngineEvent::Queued { id, url, output } => {
                 store::on_queued(id, url, output);
+                store::save();
             }
             EngineEvent::Started { id, url, output } => {
                 eprintln!("[engine] #{id} mulai -> {}", output.display());
                 store::on_started(id, url, output);
+                store::save();
             }
             EngineEvent::Renamed { id, output } => {
                 store::set_output(id, output);
+                store::save();
             }
             EngineEvent::Progress { id, downloaded, total, speed_bps, segments } => {
                 store::on_progress(id, downloaded, total, speed_bps, segments);
@@ -225,14 +228,17 @@ pub fn make_sink() -> EventSink {
             EngineEvent::Completed { id, bytes } => {
                 eprintln!("[engine] #{id} selesai ({bytes} byte)");
                 store::set_status(id, store::Status::Complete);
+                store::save();
             }
             EngineEvent::Paused { id, downloaded } => {
                 eprintln!("[engine] #{id} stopped ({downloaded} byte)");
                 store::set_status(id, store::Status::Paused);
+                store::save();
             }
             EngineEvent::Failed { id, error } => {
                 eprintln!("[engine] #{id} GAGAL: {error}");
                 store::set_status(id, store::Status::Error);
+                store::save();
             }
         }
         state::post_to_ui(state::WM_PROGRESS);
@@ -337,6 +343,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
+                store::save(); // simpan progres terakhir sebelum keluar
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -951,6 +958,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_DELETE => remove_selected(hwnd, true),
         ID_DELETE_COMPLETED => {
             store::remove_completed();
+            store::save();
             refresh_ui(hwnd);
         }
         ID_OPEN => {
@@ -1108,6 +1116,7 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
         let _ = std::fs::rename(&old_sc, &new_sc);
     }
     store::move_category(id, newpath, cat);
+    store::save();
     refresh_ui(hwnd);
 }
 
@@ -1354,6 +1363,7 @@ unsafe fn remove_selected(hwnd: HWND, delete_file: bool) {
             let _ = std::fs::remove_file(sc);
         }
     }
+    store::save();
     refresh_ui(hwnd);
 }
 

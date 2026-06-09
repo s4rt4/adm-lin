@@ -2,10 +2,11 @@
 //! engine (thread tokio), dibaca WndProc (UI thread) — dilindungi Mutex.
 
 use crate::category::Category;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Queued,
     Downloading,
@@ -26,7 +27,7 @@ impl Status {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub id: u64,
     pub url: String,
@@ -34,13 +35,18 @@ pub struct Row {
     pub name: String,
     pub size: Option<u64>,
     pub downloaded: u64,
+    /// (start, end, downloaded) per segmen/koneksi — untuk SegmentBar (§9.11).
+    /// Transien — tak dipersist.
+    #[serde(skip)]
     pub speed_bps: u64,
     pub status: Status,
-    /// (start, end, downloaded) per segmen/koneksi — untuk SegmentBar (§9.11).
+    #[serde(skip)]
     pub segments: Vec<(u64, u64, u64)>,
     /// Dialog "Download complete" sudah ditampilkan untuk baris ini.
+    #[serde(skip)]
     pub complete_announced: bool,
     /// Popup "Download failed" sudah ditampilkan untuk kegagalan terakhir.
+    #[serde(skip)]
     pub failed_announced: bool,
     pub category: Category,
 }
@@ -246,4 +252,57 @@ pub fn move_category(id: u64, output: PathBuf, category: Category) {
         r.output = output;
         r.category = category;
     }
+}
+
+// ============================ Persistensi daftar ============================
+
+fn store_file() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("ADM").join("downloads.json")
+}
+
+/// Serialisasi penulisan berkas (save bisa dipicu dari thread engine & UI).
+static SAVE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Simpan daftar unduhan ke `%APPDATA%\ADM\downloads.json` (atomik).
+/// Dipanggil pada perubahan struktural (tambah/hapus/ubah status) & saat keluar.
+pub fn save() {
+    let snapshot: Vec<Row> = ROWS.lock().unwrap().clone();
+    let _guard = SAVE_LOCK.lock().unwrap();
+    let file = store_file();
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&snapshot) {
+        let tmp = file.with_extension("json.tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+}
+
+/// Muat daftar unduhan dari disk saat startup. Mengembalikan id terbesar yang
+/// dipakai (agar engine menyetel id berikutnya supaya tak bentrok).
+pub fn load() -> u64 {
+    let Ok(bytes) = std::fs::read(store_file()) else {
+        return 0;
+    };
+    let Ok(mut rows) = serde_json::from_slice::<Vec<Row>>(&bytes) else {
+        return 0;
+    };
+    let mut max_id = 0;
+    for r in rows.iter_mut() {
+        // Tak ada yang sedang berjalan saat startup → "Downloading" jadi Stopped.
+        if r.status == Status::Downloading {
+            r.status = Status::Paused;
+        }
+        r.speed_bps = 0;
+        r.segments.clear();
+        // Jangan picu popup complete/failed untuk item lama saat dimuat.
+        r.complete_announced = true;
+        r.failed_announced = true;
+        max_id = max_id.max(r.id);
+    }
+    *ROWS.lock().unwrap() = rows;
+    max_id
 }
