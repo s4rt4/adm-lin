@@ -38,6 +38,9 @@ features = [
     "Win32_Graphics_Dwm",
 ]
 
+[build-dependencies]
+embed-resource = "2.5"
+
 [dev-dependencies]
 tiny_http = "0.12"
 sha2 = "0.10"

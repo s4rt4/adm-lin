@@ -12,4 +12,9 @@ fn main() {
             manifest.display()
         );
     }
+
+    // Tanam ikon (ID 1) ke resource exe → tampil di Explorer & taskbar.
+    println!("cargo:rerun-if-changed=app.rc");
+    println!("cargo:rerun-if-changed=assets/adm.ico");
+    let _ = embed_resource::compile("app.rc", embed_resource::NONE);
 }
