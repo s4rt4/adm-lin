@@ -116,7 +116,7 @@ const ID_ABOUT: usize = 0x142;
 
 const ID_RESUME: usize = 0x150;
 const ID_DELETE: usize = 0x151;
-const ID_TELL_FRIEND: usize = 0x152;
+const ID_UPDATES: usize = 0x152;
 const ID_OPEN: usize = 0x153;
 const ID_OPEN_FOLDER: usize = 0x154;
 
@@ -691,7 +691,7 @@ unsafe fn add_toolbar_buttons(tb: HWND) {
     mkbtn(&mut buttons, ID_START_QUEUE, "Start Queue", 8, true);
     mkbtn(&mut buttons, ID_STOP_QUEUE, "Stop Queue", 9, true);
     mksep(&mut buttons);
-    mkbtn(&mut buttons, ID_TELL_FRIEND, "Share", 10, false);
+    mkbtn(&mut buttons, ID_UPDATES, "Updates", 10, false);
 
     SendMessageW(
         tb,
@@ -986,7 +986,9 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_SITE_GRABBER => info(hwnd, "Site grabber = fase lanjutan."),
         ID_EXPORT | ID_IMPORT => info(hwnd, "Export/Import menyusul."),
         ID_REDOWNLOAD => info(hwnd, "Redownload menyusul."),
-        ID_TELL_FRIEND => info(hwnd, "Bagikan ADM ke teman :)"),
+        ID_UPDATES => {
+            ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
+        }
         ID_HELP | ID_CHECK_UPDATES => info(hwnd, "Menyusul."),
         ID_DROP_TARGET | ID_ARRANGE | ID_TOOLBAR | ID_TRAY_ICON | ID_CUSTOMIZE | ID_FONT
         | ID_LANGUAGE => info(hwnd, "Menyusul."),

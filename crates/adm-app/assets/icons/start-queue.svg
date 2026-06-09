@@ -1,18 +1,1 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 24 24">
-  <!-- Generator: Adobe Illustrator 30.0.0, SVG Export Plug-In . SVG Version: 2.1.1 Build 123)  -->
-  <defs>
-    <style>
-      .st0 {
-        fill: none;
-        stroke: #000;
-        stroke-linecap: round;
-        stroke-linejoin: round;
-        stroke-width: 2px;
-      }
-    </style>
-  </defs>
-  <path class="st0" d="M13,13.74c-.62.36-1.38.36-2,0L2.5,8.87c-.48-.27-.65-.88-.38-1.36.09-.16.22-.29.38-.38L11,2.26c.62-.36,1.38-.36,2,0l8.5,4.87c.48.27.65.88.38,1.36-.09.16-.22.29-.38.38l-8.5,4.87Z"/>
-  <path class="st0" d="M20,14.28l1.5.85c.48.27.65.88.38,1.36-.09.16-.22.29-.38.38l-8.5,4.87c-.62.36-1.38.36-2,0l-8.5-4.87c-.48-.27-.65-.88-.38-1.36.09-.16.22-.29.38-.38l1.5-.85"/>
-  <polygon class="st0" points="16.42 7.93 11.31 4.98 11.31 10.88 16.42 7.93"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-list-video-icon lucide-list-video"><path d="M21 5H3"/><path d="M10 12H3"/><path d="M10 19H3"/><path d="M15 12.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997a1 1 0 0 1-1.517-.86z"/></svg>

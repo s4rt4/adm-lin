@@ -18,7 +18,7 @@ const TOOLBAR_ORDER: [&str; 11] = [
     "scheduler",
     "start-queue",
     "stop-queue",
-    "tell-a-friend",
+    "updates",
 ];
 
 fn main() {
