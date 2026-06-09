@@ -22,12 +22,11 @@ const ID_DIR: usize = 1;
 const ID_QUEUE: usize = 2;
 const ID_LIMIT: usize = 3;
 const ID_AUTOSTART: usize = 4;
-const ID_LANG: usize = 5;
 const ID_OK: usize = 20;
 const ID_CANCEL: usize = 21;
 
-// 0 dir, 1 queue, 2 limit, 3 autostart, 4 lang
-static CTRL: Mutex<[isize; 5]> = Mutex::new([0; 5]);
+// 0 dir, 1 queue, 2 limit, 3 autostart
+static CTRL: Mutex<[isize; 4]> = Mutex::new([0; 4]);
 
 fn set_ctrl(i: usize, h: HWND) {
     CTRL.lock().unwrap()[i] = h.0 as isize;
@@ -102,9 +101,14 @@ pub fn show(parent: HWND) {
             .or_else(|| crate::gui::engine().map(|e| e.download_dir().to_string_lossy().into_owned()))
             .unwrap_or_default();
 
+        // Ukuran CLIENT yang diinginkan → window dibesarkan agar tombol bawah
+        // tidak terpotong oleh caption/border.
+        let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        let mut rc = RECT { left: 0, top: 0, right: 460, bottom: 246 };
+        let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
+        let (dw, dh) = (rc.right - rc.left, rc.bottom - rc.top);
         let mut pr = RECT::default();
         let _ = GetWindowRect(parent, &mut pr);
-        let (dw, dh) = (480, 280);
         let x = (pr.left + ((pr.right - pr.left) - dw) / 2).max(0);
         let y = (pr.top + ((pr.bottom - pr.top) - dh) / 2).max(0);
 
@@ -112,7 +116,7 @@ pub fn show(parent: HWND) {
             WS_EX_DLGMODALFRAME,
             CLASS,
             w!("Options"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            style,
             x, y, dw, dh,
             Some(parent),
             None,
@@ -121,36 +125,37 @@ pub fn show(parent: HWND) {
         );
         let Ok(dlg) = dlg else { return };
 
-        let _ = mk(dlg, w!("STATIC"), w!("Download folder:"), WINDOW_STYLE(0), 16, 18, 120, 18, 0);
-        let d = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | ES_AUTOHSCROLL as u32), 16, 38, 440, 22, ID_DIR);
+        // Tata letak: margin 20, kolom kanan field numerik rata di x=350..440.
+        const M: i32 = 20;
+        const FW: i32 = 420; // lebar penuh (folder)
+        const EH: i32 = 24; // tinggi field
+
+        // Folder unduhan (label di atas, field selebar dialog).
+        let _ = mk(dlg, w!("STATIC"), w!("Download folder:"), WINDOW_STYLE(0), M, 16, 200, 16, 0);
+        let d = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_AUTOHSCROLL as u32), M, 36, FW, EH, ID_DIR);
         set_text(d, &dir);
         set_ctrl(0, d);
 
-        let _ = mk(dlg, w!("STATIC"), w!("Max simultaneous (queue):"), WINDOW_STYLE(0), 16, 74, 180, 18, 0);
-        let q = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | ES_NUMBER as u32), 200, 72, 60, 22, ID_QUEUE);
+        // Maksimum unduhan simultan (label kiri, field numerik kanan).
+        let _ = mk(dlg, w!("STATIC"), w!("Maximum simultaneous downloads:"), WINDOW_STYLE(0), M, 80, 290, 16, 0);
+        let q = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_NUMBER as u32 | ES_CENTER as u32), 350, 78, 90, EH, ID_QUEUE);
         set_text(q, &cfg.queue_max.to_string());
         set_ctrl(1, q);
 
-        let _ = mk(dlg, w!("STATIC"), w!("Global speed limit (KB/s, 0=unlimited):"), WINDOW_STYLE(0), 16, 108, 250, 18, 0);
-        let l = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | ES_NUMBER as u32), 270, 106, 80, 22, ID_LIMIT);
+        // Batas kecepatan global.
+        let _ = mk(dlg, w!("STATIC"), w!("Global speed limit (KB/s, 0 = unlimited):"), WINDOW_STYLE(0), M, 116, 320, 16, 0);
+        let l = mk(dlg, w!("EDIT"), PCWSTR::null(), WINDOW_STYLE(WS_BORDER.0 | WS_TABSTOP.0 | ES_NUMBER as u32 | ES_CENTER as u32), 350, 114, 90, EH, ID_LIMIT);
         set_text(l, &cfg.global_limit_kbps.to_string());
         set_ctrl(2, l);
 
-        let a = mk(dlg, w!("BUTTON"), w!("Start with Windows"), WINDOW_STYLE(BS_AUTOCHECKBOX as u32), 16, 142, 220, 20, ID_AUTOSTART);
+        // Autostart.
+        let a = mk(dlg, w!("BUTTON"), w!("Start with Windows"), WINDOW_STYLE(WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32), M, 154, 300, 22, ID_AUTOSTART);
         SendMessageW(a, BM_SETCHECK, Some(WPARAM(if cfg.autostart { 1 } else { 0 })), Some(LPARAM(0)));
         set_ctrl(3, a);
 
-        let _ = mk(dlg, w!("STATIC"), w!("Language:"), WINDOW_STYLE(0), 16, 176, 80, 18, 0);
-        let lang = mk(dlg, w!("COMBOBOX"), PCWSTR::null(), WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0), 100, 174, 160, 200, ID_LANG);
-        for s in ["English (en)", "Indonesia (id)"] {
-            let hs = HSTRING::from(s);
-            SendMessageW(lang, CB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(hs.as_ptr() as isize)));
-        }
-        SendMessageW(lang, CB_SETCURSEL, Some(WPARAM(if cfg.language == "id" { 1 } else { 0 })), Some(LPARAM(0)));
-        set_ctrl(4, lang);
-
-        let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 280, 220, 80, 28, ID_OK);
-        let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 372, 220, 80, 28, ID_CANCEL);
+        // Tombol (rata kanan di tepi bawah area klien).
+        let _ = mk(dlg, w!("BUTTON"), w!("OK"), WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32), 264, 200, 84, 30, ID_OK);
+        let _ = mk(dlg, w!("BUTTON"), w!("Cancel"), WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32), 356, 200, 84, 30, ID_CANCEL);
 
         let _ = EnableWindow(parent, false);
         let _ = ShowWindow(dlg, SW_SHOW);
@@ -175,18 +180,12 @@ pub fn show(parent: HWND) {
             let queue_max = get_text(ctrl(1)).trim().parse::<usize>().unwrap_or(1).max(1);
             let limit = get_text(ctrl(2)).trim().parse::<u64>().unwrap_or(0);
             let auto = SendMessageW(ctrl(3), BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1;
-            let lang = if SendMessageW(ctrl(4), CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1 {
-                "id"
-            } else {
-                "en"
-            };
 
             settings::update(|s| {
                 s.download_dir = if dir.is_empty() { None } else { Some(dir.clone()) };
                 s.queue_max = queue_max;
                 s.global_limit_kbps = limit;
                 s.autostart = auto;
-                s.language = lang.to_string();
             });
 
             if let Some(e) = crate::gui::engine() {
