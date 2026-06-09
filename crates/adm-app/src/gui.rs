@@ -449,6 +449,8 @@ unsafe fn create_children(hwnd: HWND, instance: HINSTANCE) {
     SendMessageW(tb, TB_SETEXTENDEDSTYLE, Some(WPARAM(0)), Some(LPARAM((TBSTYLE_EX_MIXEDBUTTONS | TBSTYLE_EX_DRAWDDARROWS) as isize)));
     let himl = build_toolbar_imagelist(false);
     SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
+    let diml = build_disabled_imagelist();
+    SendMessageW(tb, TB_SETDISABLEDIMAGELIST, Some(WPARAM(0)), Some(LPARAM(diml.0)));
     add_toolbar_buttons(tb);
     SendMessageW(tb, TB_AUTOSIZE, Some(WPARAM(0)), Some(LPARAM(0)));
     state::store_hwnd(&state::TOOLBAR_HWND, tb);
@@ -1394,7 +1396,7 @@ unsafe fn toolbar_customdraw(lparam: LPARAM) -> LRESULT {
 
 /// Bangun ImageList 24x24 ARGB dari blob BGRA. Ikon Lucide monokrom hitam;
 /// untuk tema gelap di-tint jadi abu terang (premultiplied) agar terlihat.
-unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
+unsafe fn build_imagelist_with(transform: impl Fn(&mut [u8])) -> HIMAGELIST {
     const N: i32 = 11;
     const SZ: i32 = 24;
     let stride = (SZ * SZ * 4) as usize;
@@ -1410,14 +1412,8 @@ unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
 
     for i in 0..N as usize {
         let mut buf = TB_ICONS[i * stride..(i + 1) * stride].to_vec();
-        if dark {
-            for px in buf.chunks_exact_mut(4) {
-                let a = px[3] as u32;
-                let v = (0xDC * a / 255) as u8; // premultiplied light-gray
-                px[0] = v;
-                px[1] = v;
-                px[2] = v;
-            }
+        for px in buf.chunks_exact_mut(4) {
+            transform(px);
         }
         let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
         if let Ok(hbmp) = CreateDIBSection(Some(screen), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
@@ -1430,6 +1426,31 @@ unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
     }
     ReleaseDC(None, screen);
     himl
+}
+
+/// Imagelist normal (ikon hitam; tema gelap → di-tint terang).
+unsafe fn build_toolbar_imagelist(dark: bool) -> HIMAGELIST {
+    build_imagelist_with(move |px| {
+        if dark {
+            let a = px[3] as u32;
+            let v = (0xDC * a / 255) as u8;
+            px[0] = v;
+            px[1] = v;
+            px[2] = v;
+        }
+    })
+}
+
+/// Imagelist untuk tombol disabled: abu-abu + dipudarkan (alpha 50%).
+unsafe fn build_disabled_imagelist() -> HIMAGELIST {
+    build_imagelist_with(|px| {
+        let fa = px[3] as u32 / 2; // alpha 50%
+        let v = (0xA0 * fa / 255) as u8; // abu-abu premultiplied
+        px[0] = v;
+        px[1] = v;
+        px[2] = v;
+        px[3] = fa as u8;
+    })
 }
 
 /// Terapkan tema aktif (plan §12): title bar gelap, warna ListView/TreeView,
@@ -1474,6 +1495,8 @@ unsafe fn apply_theme(hwnd: HWND) {
     if let Some(tb) = state::load_hwnd(&state::TOOLBAR_HWND) {
         let himl = build_toolbar_imagelist(dark);
         SendMessageW(tb, TB_SETIMAGELIST, Some(WPARAM(0)), Some(LPARAM(himl.0)));
+        let diml = build_disabled_imagelist();
+        SendMessageW(tb, TB_SETDISABLEDIMAGELIST, Some(WPARAM(0)), Some(LPARAM(diml.0)));
         let _ = InvalidateRect(Some(tb), None, true);
     }
     if let Some(ms) = state::load_hwnd(&state::MENUSTRIP_HWND) {
