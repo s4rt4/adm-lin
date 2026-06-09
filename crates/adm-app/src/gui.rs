@@ -1075,17 +1075,22 @@ unsafe fn do_add(hwnd: HWND) {
 unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
     let Some(engine) = ENGINE.get() else { return };
     let dir = engine.download_dir();
-    let default_url = incoming.as_ref().map(|p| p.url.clone()).unwrap_or_default();
-    let default_name = incoming.as_ref().and_then(|p| p.filename.clone());
 
-    if let Some((mut params, start_now)) =
-        dialogs::add_dialog(hwnd, &default_url, default_name.as_deref(), &dir)
-    {
-        // Bawa metadata browser (referrer/UA/cookies) bila ada.
+    // Browser (incoming Some) → "Download File Info" dengan nama file otomatis.
+    // Manual (None) → dialog "Add new download" sederhana tanpa nama file.
+    let result = if let Some(inc) = &incoming {
+        dialogs::download_info_dialog(hwnd, &inc.url, inc.filename.as_deref(), &dir)
+    } else {
+        dialogs::add_url_dialog(hwnd, "")
+    };
+
+    if let Some((mut params, start_now)) = result {
+        // Bawa metadata browser (referrer/UA/cookies/nama) bila ada.
         if let Some(inc) = &incoming {
             params.referrer = params.referrer.or_else(|| inc.referrer.clone());
             params.user_agent = params.user_agent.or_else(|| inc.user_agent.clone());
             params.cookies = params.cookies.or_else(|| inc.cookies.clone());
+            params.filename = params.filename.or_else(|| inc.filename.clone());
         }
         if start_now {
             let id = engine.add(params);

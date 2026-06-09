@@ -92,12 +92,30 @@ fn read_text(slot: &Mutex<isize>) -> String {
     }
 }
 
-/// Tampilkan dialog Add modal. Mengembalikan params bila user menekan Start.
-pub fn add_dialog(
+/// Dialog "Add new download" (manual): URL + Category + Size. TANPA field nama
+/// file — engine menamai otomatis (Content-Disposition → basename URL).
+pub fn add_url_dialog(parent: HWND, default_url: &str) -> Option<(DownloadAddParams, bool)> {
+    dialog_impl(parent, default_url, None, Path::new(""), false)
+}
+
+/// Dialog "Download File Info" (download start dari browser): seperti di atas
+/// PLUS field "Save As" dengan nama file terdeteksi otomatis.
+pub fn download_info_dialog(
     parent: HWND,
     default_url: &str,
     default_filename: Option<&str>,
     download_dir: &Path,
+) -> Option<(DownloadAddParams, bool)> {
+    dialog_impl(parent, default_url, default_filename, download_dir, true)
+}
+
+/// Implementasi bersama. `with_filename` menentukan apakah field "Save As" ada.
+fn dialog_impl(
+    parent: HWND,
+    default_url: &str,
+    default_filename: Option<&str>,
+    download_dir: &Path,
+    with_filename: bool,
 ) -> Option<(DownloadAddParams, bool)> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None).ok()?.into();
@@ -116,11 +134,13 @@ pub fn add_dialog(
 
         DONE.store(false, Ordering::SeqCst);
         *RESULT.lock().unwrap() = None;
+        *SAVE_EDIT.lock().unwrap() = 0; // 0 = tak ada field nama file (mode manual)
 
         // Ukuran CLIENT diinginkan; window dibesarkan agar client = ini
         // (kontrol kanan tak kepotong / mepet).
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-        let mut rcsz = RECT { left: 0, top: 0, right: 568, bottom: 250 };
+        let client_h = if with_filename { 250 } else { 208 };
+        let mut rcsz = RECT { left: 0, top: 0, right: 568, bottom: client_h };
         let _ = AdjustWindowRectEx(&mut rcsz, style, false, WS_EX_DLGMODALFRAME);
         let (dw, dh) = (rcsz.right - rcsz.left, rcsz.bottom - rcsz.top);
 
@@ -129,10 +149,11 @@ pub fn add_dialog(
         let x = pr.left + ((pr.right - pr.left) - dw) / 2;
         let y = pr.top + ((pr.bottom - pr.top) - dh) / 2;
 
+        let title = if with_filename { w!("Download File Info") } else { w!("Add new download") };
         let dlg = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             CLASS,
-            w!("Download File Info"),
+            title,
             style,
             x.max(0),
             y.max(0),
@@ -170,55 +191,50 @@ pub fn add_dialog(
         }
         SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
 
-        let _ = make_child(dlg, w!("STATIC"), w!("Save As:"), WINDOW_STYLE(0), 16, 94, 60, 18, 0, instance);
-        let save = make_child(
-            dlg, w!("EDIT"), PCWSTR::null(),
-            WINDOW_STYLE((WS_BORDER.0 | WS_TABSTOP.0) | ES_AUTOHSCROLL as u32),
-            84, 92, 452, 22, 102, instance,
-        );
-        *SAVE_EDIT.lock().unwrap() = save.0 as isize;
-        // Prefill Save As: <download_dir>\<nama dari browser / tebakan url>
-        let base = default_filename
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| guess_filename(default_url));
-        let initial = download_dir.join(&base);
-        let h = HSTRING::from(initial.to_string_lossy().into_owned());
-        let _ = SetWindowTextW(save, PCWSTR(h.as_ptr()));
+        // Field "Save As" hanya untuk download start (browser).
+        let size_y = if with_filename {
+            let _ = make_child(dlg, w!("STATIC"), w!("Save As:"), WINDOW_STYLE(0), 16, 94, 60, 18, 0, instance);
+            let save = make_child(
+                dlg, w!("EDIT"), PCWSTR::null(),
+                WINDOW_STYLE((WS_BORDER.0 | WS_TABSTOP.0) | ES_AUTOHSCROLL as u32),
+                84, 92, 452, 22, 102, instance,
+            );
+            *SAVE_EDIT.lock().unwrap() = save.0 as isize;
+            // Prefill: <download_dir>\<nama dari browser / tebakan url>
+            let base = default_filename
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| guess_filename(default_url));
+            let initial = download_dir.join(&base);
+            let h = HSTRING::from(initial.to_string_lossy().into_owned());
+            let _ = SetWindowTextW(save, PCWSTR(h.as_ptr()));
+            126
+        } else {
+            94 // tanpa Save As → Size naik ke baris itu
+        };
 
-        // Readout ukuran (di-probe async; "terdeteksi setelah beberapa saat").
-        let _ = make_child(dlg, w!("STATIC"), w!("Size:"), WINDOW_STYLE(0), 16, 126, 50, 18, 0, instance);
-        let size_lbl = make_child(dlg, w!("STATIC"), w!("\u{2026}"), WINDOW_STYLE(0), 70, 126, 200, 18, 0, instance);
+        // Readout ukuran (di-probe async; juga saat URL diisi/diubah).
+        let _ = make_child(dlg, w!("STATIC"), w!("Size:"), WINDOW_STYLE(0), 16, size_y, 50, 18, 0, instance);
+        let size_lbl = make_child(dlg, w!("STATIC"), w!("\u{2026}"), WINDOW_STYLE(0), 70, size_y, 200, 18, 0, instance);
         *SIZE_LABEL.lock().unwrap() = size_lbl.0 as isize;
         if !default_url.is_empty() {
-            if let Some(eng) = crate::gui::engine() {
-                let url = default_url.to_string();
-                let dlg_isize = dlg.0 as isize;
-                eng.runtime().spawn(async move {
-                    let total = adm_core::probe_url(&url).await.ok().and_then(|p| p.total).unwrap_or(0);
-                    let _ = PostMessageW(
-                        Some(HWND(dlg_isize as *mut core::ffi::c_void)),
-                        WM_SIZE_RESULT,
-                        WPARAM(total as usize),
-                        LPARAM(0),
-                    );
-                });
-            }
+            spawn_size_probe(dlg, default_url);
         }
 
+        let btn_y = size_y + 34;
         let _ = make_child(
             dlg, w!("BUTTON"), w!("Download Later"),
             WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-            120, 160, 120, 30, IDLATER, instance,
+            120, btn_y, 120, 30, IDLATER, instance,
         );
         let _ = make_child(
             dlg, w!("BUTTON"), w!("Start Download"),
             WINDOW_STYLE(WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32),
-            250, 160, 140, 30, IDOK, instance,
+            250, btn_y, 140, 30, IDOK, instance,
         );
         let _ = make_child(
             dlg, w!("BUTTON"), w!("Cancel"),
             WINDOW_STYLE(WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
-            400, 160, 100, 30, IDCANCEL, instance,
+            400, btn_y, 100, 30, IDCANCEL, instance,
         );
 
         let _ = EnableWindow(parent, false);
@@ -253,16 +269,31 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
         match msg {
             WM_COMMAND => {
                 let id = wparam.0 & 0xFFFF;
+                let code = (wparam.0 >> 16) & 0xFFFF;
+                // URL diisi/diubah lalu kehilangan fokus → probe ukuran.
+                if id == 100 && code == EN_KILLFOCUS as usize {
+                    let url = read_text(&URL_EDIT);
+                    let url = url.trim();
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        spawn_size_probe(hwnd, url);
+                    }
+                    return LRESULT(0);
+                }
                 match id {
                     IDOK | IDLATER => {
                         let url = read_text(&URL_EDIT);
                         if !url.trim().is_empty() {
-                            let save = read_text(&SAVE_EDIT);
-                            let filename = save
-                                .rsplit(['\\', '/'])
-                                .next()
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string());
+                            // filename hanya bila field "Save As" ada (mode browser);
+                            // mode manual → None, engine menamai otomatis.
+                            let filename = if *SAVE_EDIT.lock().unwrap() != 0 {
+                                read_text(&SAVE_EDIT)
+                                    .rsplit(['\\', '/'])
+                                    .next()
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            };
                             *RESULT.lock().unwrap() = Some(DownloadAddParams {
                                 url: url.trim().to_string(),
                                 filename,
@@ -299,6 +330,23 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+/// Probe ukuran async; hasil dikirim balik ke dialog via WM_SIZE_RESULT.
+unsafe fn spawn_size_probe(dlg: HWND, url: &str) {
+    if let Some(eng) = crate::gui::engine() {
+        let url = url.to_string();
+        let dlg_isize = dlg.0 as isize;
+        eng.runtime().spawn(async move {
+            let total = adm_core::probe_url(&url).await.ok().and_then(|p| p.total).unwrap_or(0);
+            let _ = PostMessageW(
+                Some(HWND(dlg_isize as *mut core::ffi::c_void)),
+                WM_SIZE_RESULT,
+                WPARAM(total as usize),
+                LPARAM(0),
+            );
+        });
     }
 }
 
