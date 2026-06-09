@@ -55,8 +55,10 @@ fn dispatch(req: Request, engine: &EngineHandle) -> Response {
         method::DOWNLOAD_ADD => match req.params {
             Some(p) => match serde_json::from_value::<DownloadAddParams>(p) {
                 Ok(params) if !params.url.is_empty() => {
-                    let id = engine.add(params);
-                    Response::ok(req.id, json!({ "accepted": true, "id": id }))
+                    // Jangan langsung mulai: serahkan ke UI untuk dialog
+                    // "Download File Info" (user yang memutuskan mulai/queue).
+                    crate::gui::request_add(params);
+                    Response::ok(req.id, json!({ "accepted": true }))
                 }
                 Ok(_) => Response::err(req.id, adm_ipc::INVALID_PARAMS, "url kosong"),
                 Err(e) => Response::err(req.id, adm_ipc::INVALID_PARAMS, format!("params: {e}")),

@@ -3,6 +3,7 @@
 
 use crate::engine::{EngineEvent, EngineHandle, EventSink};
 use crate::{autostart, dialogs, state, store};
+use adm_ipc::DownloadAddParams;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
@@ -157,6 +158,40 @@ pub fn engine() -> Option<EngineHandle> {
     ENGINE.get().cloned()
 }
 
+/// Anti-duplikat: URL terakhir + waktunya (mencegah unduhan dobel saat browser
+/// mengirim `download.add` 2x untuk satu klik).
+static LAST_ADD: Mutex<Option<(String, std::time::Instant)>> = Mutex::new(None);
+
+/// Dipanggil dari thread IPC (browser/bridge): titip unduhan ke UI thread untuk
+/// dialog "Download File Info" (tidak langsung mulai). Menunggu window siap.
+pub fn request_add(params: DownloadAddParams) {
+    // Tolak duplikat URL yang sama dalam 3 detik.
+    {
+        let now = std::time::Instant::now();
+        let mut last = LAST_ADD.lock().unwrap();
+        if let Some((u, t)) = last.as_ref() {
+            if *u == params.url && now.duration_since(*t) < std::time::Duration::from_secs(3) {
+                return;
+            }
+        }
+        *last = Some((params.url.clone(), now));
+    }
+    for _ in 0..60 {
+        if state::load_hwnd(&state::MAIN_HWND).is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if let Some(hwnd) = state::load_hwnd(&state::MAIN_HWND) {
+        let ptr = Box::into_raw(Box::new(params));
+        unsafe {
+            if PostMessageW(Some(hwnd), state::WM_ADD_DOWNLOAD, WPARAM(0), LPARAM(ptr as isize)).is_err() {
+                drop(Box::from_raw(ptr)); // post gagal → jangan bocor
+            }
+        }
+    }
+}
+
 /// EventSink GUI: perbarui store + post ke UI thread.
 pub fn make_sink() -> EventSink {
     Arc::new(|ev: EngineEvent| {
@@ -167,6 +202,9 @@ pub fn make_sink() -> EventSink {
             EngineEvent::Started { id, url, output } => {
                 eprintln!("[engine] #{id} mulai -> {}", output.display());
                 store::on_started(id, url, output);
+            }
+            EngineEvent::Renamed { id, output } => {
+                store::set_output(id, output);
             }
             EngineEvent::Progress { id, downloaded, total, speed_bps, segments } => {
                 store::on_progress(id, downloaded, total, speed_bps, segments);
@@ -295,6 +333,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             state::WM_ACTIVATE_APP => {
                 show_window(hwnd);
+                LRESULT(0)
+            }
+            state::WM_ADD_DOWNLOAD => {
+                let ptr = lparam.0 as *mut DownloadAddParams;
+                if !ptr.is_null() {
+                    let params = *Box::from_raw(ptr);
+                    show_window(hwnd); // munculkan dari tray bila perlu
+                    show_add(hwnd, Some(params));
+                }
                 LRESULT(0)
             }
             state::WM_TRAY => {
@@ -1006,15 +1053,35 @@ unsafe fn do_move(hwnd: HWND, idx: usize) {
 }
 
 unsafe fn do_add(hwnd: HWND) {
+    show_add(hwnd, None);
+}
+
+/// Tampilkan dialog "Download File Info". `incoming` = titipan dari browser
+/// (url+metadata). User memutuskan Start (→ mulai + dialog status) / Download
+/// Later (→ antrian) / Cancel. Tidak ada yang mulai tanpa konfirmasi user.
+unsafe fn show_add(hwnd: HWND, incoming: Option<DownloadAddParams>) {
     let Some(engine) = ENGINE.get() else { return };
     let dir = engine.download_dir();
-    if let Some((params, start_now)) = dialogs::add_dialog(hwnd, "", &dir) {
+    let default_url = incoming.as_ref().map(|p| p.url.clone()).unwrap_or_default();
+    let default_name = incoming.as_ref().and_then(|p| p.filename.clone());
+
+    if let Some((mut params, start_now)) =
+        dialogs::add_dialog(hwnd, &default_url, default_name.as_deref(), &dir)
+    {
+        // Bawa metadata browser (referrer/UA/cookies) bila ada.
+        if let Some(inc) = &incoming {
+            params.referrer = params.referrer.or_else(|| inc.referrer.clone());
+            params.user_agent = params.user_agent.or_else(|| inc.user_agent.clone());
+            params.cookies = params.cookies.or_else(|| inc.cookies.clone());
+        }
         if start_now {
-            engine.add(params);
+            let id = engine.add(params);
+            refresh_ui(hwnd);
+            crate::progress::open(hwnd, id); // dialog "Download status"
         } else {
             engine.enqueue(params);
+            refresh_ui(hwnd);
         }
-        refresh_ui(hwnd);
     }
 }
 

@@ -21,6 +21,9 @@ static REGISTERED: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
 static START_NOW: AtomicBool = AtomicBool::new(true);
 static RESULT: Mutex<Option<DownloadAddParams>> = Mutex::new(None);
+/// Hasil probe ukuran dikirim ke dialog (wparam = total byte).
+const WM_SIZE_RESULT: u32 = WM_APP + 10;
+static SIZE_LABEL: Mutex<isize> = Mutex::new(0);
 // HWND edit (sebagai isize) — dialog modal tunggal, jadi global aman.
 static URL_EDIT: Mutex<isize> = Mutex::new(0);
 static SAVE_EDIT: Mutex<isize> = Mutex::new(0);
@@ -93,6 +96,7 @@ fn read_text(slot: &Mutex<isize>) -> String {
 pub fn add_dialog(
     parent: HWND,
     default_url: &str,
+    default_filename: Option<&str>,
     download_dir: &Path,
 ) -> Option<(DownloadAddParams, bool)> {
     unsafe {
@@ -168,11 +172,33 @@ pub fn add_dialog(
             84, 92, 452, 22, 102, instance,
         );
         *SAVE_EDIT.lock().unwrap() = save.0 as isize;
-        // Prefill Save As: <download_dir>\<basename url>
-        let base = guess_filename(default_url);
+        // Prefill Save As: <download_dir>\<nama dari browser / tebakan url>
+        let base = default_filename
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| guess_filename(default_url));
         let initial = download_dir.join(&base);
         let h = HSTRING::from(initial.to_string_lossy().into_owned());
         let _ = SetWindowTextW(save, PCWSTR(h.as_ptr()));
+
+        // Readout ukuran (di-probe async; "terdeteksi setelah beberapa saat").
+        let _ = make_child(dlg, w!("STATIC"), w!("Size:"), WINDOW_STYLE(0), 16, 126, 50, 18, 0, instance);
+        let size_lbl = make_child(dlg, w!("STATIC"), w!("\u{2026}"), WINDOW_STYLE(0), 70, 126, 200, 18, 0, instance);
+        *SIZE_LABEL.lock().unwrap() = size_lbl.0 as isize;
+        if !default_url.is_empty() {
+            if let Some(eng) = crate::gui::engine() {
+                let url = default_url.to_string();
+                let dlg_isize = dlg.0 as isize;
+                eng.runtime().spawn(async move {
+                    let total = adm_core::probe_url(&url).await.ok().and_then(|p| p.total).unwrap_or(0);
+                    let _ = PostMessageW(
+                        Some(HWND(dlg_isize as *mut core::ffi::c_void)),
+                        WM_SIZE_RESULT,
+                        WPARAM(total as usize),
+                        LPARAM(0),
+                    );
+                });
+            }
+        }
 
         let _ = make_child(
             dlg, w!("BUTTON"), w!("Download Later"),
@@ -251,6 +277,16 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                     _ => DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
             }
+            WM_SIZE_RESULT => {
+                let total = wparam.0 as u64;
+                let h = *SIZE_LABEL.lock().unwrap();
+                if h != 0 {
+                    let txt = if total > 0 { fmt_size(total) } else { "Unknown".to_string() };
+                    let hs = HSTRING::from(txt);
+                    let _ = SetWindowTextW(HWND(h as *mut core::ffi::c_void), PCWSTR(hs.as_ptr()));
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 DONE.store(true, Ordering::SeqCst);
                 let _ = DestroyWindow(hwnd);
@@ -258,6 +294,19 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+fn fmt_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2} GB", b / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024.0 * 1024.0 {
+        format!("{:.2} MB", b / (1024.0 * 1024.0))
+    } else if b >= 1024.0 {
+        format!("{:.2} KB", b / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 

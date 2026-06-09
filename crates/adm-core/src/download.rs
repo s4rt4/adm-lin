@@ -88,6 +88,9 @@ impl SegState {
 fn build_client() -> Result<Client> {
     Ok(Client::builder()
         .user_agent(concat!("ADM/", env!("CARGO_PKG_VERSION")))
+        // Jangan simpan koneksi idle (probe singkat tak meninggalkan keep-alive
+        // yang menggantung; tiap segmen pakai koneksi sendiri).
+        .pool_max_idle_per_host(0)
         .build()?)
 }
 

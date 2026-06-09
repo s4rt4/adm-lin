@@ -17,6 +17,8 @@ use tokio::runtime::Handle;
 pub enum EngineEvent {
     Queued { id: u64, url: String, output: PathBuf },
     Started { id: u64, url: String, output: PathBuf },
+    /// Nama berkas dikoreksi (mis. dari Content-Disposition) setelah mulai.
+    Renamed { id: u64, output: PathBuf },
     Progress {
         id: u64,
         downloaded: u64,
@@ -85,6 +87,11 @@ impl EngineHandle {
 
     pub fn download_dir(&self) -> PathBuf {
         self.download_dir.lock().unwrap().clone()
+    }
+
+    /// Handle runtime tokio (untuk spawn probe dari UI thread, mis. ukuran file).
+    pub fn runtime(&self) -> Handle {
+        self.handle.clone()
     }
 
     pub fn set_download_dir(&self, dir: PathBuf) {
@@ -196,6 +203,15 @@ impl EngineHandle {
             .unwrap()
             .insert(id, (cancel.clone(), per_limiter.clone()));
 
+        // Baris instan dengan tebakan nama (agar list & dialog progres langsung
+        // ada); dikoreksi setelah resolusi nama (Content-Disposition).
+        let guess_output = self.output_for(&params, id);
+        (self.sink)(EngineEvent::Started {
+            id,
+            url: params.url.clone(),
+            output: guess_output,
+        });
+
         let prog = self.sink.clone();
         let on_progress: ProgressCb = Arc::new(move |p: Progress| {
             let segments = p.segments.iter().map(|s| (s.start, s.end, s.downloaded)).collect();
@@ -219,11 +235,8 @@ impl EngineHandle {
             }
             let output = dir.join(&name);
 
-            (this.sink)(EngineEvent::Started {
-                id,
-                url: params.url.clone(),
-                output: output.clone(),
-            });
+            // Koreksi nama baris (placeholder Started sudah diemit sinkron).
+            (this.sink)(EngineEvent::Renamed { id, output: output.clone() });
 
             let req = DownloadRequest {
                 url: params.url.clone(),

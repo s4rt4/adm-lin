@@ -3,6 +3,17 @@
 
 const HOST = "com.adm.bridge";
 
+// Anti-duplikat: lewati URL yang sama yang baru dikirim < 5 detik lalu
+// (onCreated bisa terpicu lebih dari sekali untuk satu unduhan).
+const recentlySent = new Map();
+function isDuplicate(url) {
+  const now = Date.now();
+  for (const [u, t] of recentlySent) if (now - t > 5000) recentlySent.delete(u);
+  if (recentlySent.has(url) && now - recentlySent.get(url) < 5000) return true;
+  recentlySent.set(url, now);
+  return false;
+}
+
 let enabled = true;
 chrome.storage.local.get({ enabled: true }, (v) => { enabled = v.enabled; });
 chrome.storage.onChanged.addListener((changes) => {
@@ -39,6 +50,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
 });
 
 function sendToAdm(url, filename) {
+  if (isDuplicate(url)) return;
   const msg = { method: "download.add", url };
   if (filename) msg.filename = filename;
   chrome.runtime.sendNativeMessage(HOST, msg, () => {

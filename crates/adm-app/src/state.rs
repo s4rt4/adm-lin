@@ -10,6 +10,9 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_PROGRESS: u32 = WM_APP + 2;
 /// Instance kedua minta jendela dimunculkan.
 pub const WM_ACTIVATE_APP: u32 = WM_APP + 3;
+/// Browser/bridge menitip unduhan → tampilkan dialog "Download File Info".
+/// lparam = `*mut DownloadAddParams` (Box mentah, diambil-alih UI thread).
+pub const WM_ADD_DOWNLOAD: u32 = WM_APP + 4;
 
 pub static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 pub static MENUSTRIP_HWND: AtomicIsize = AtomicIsize::new(0);

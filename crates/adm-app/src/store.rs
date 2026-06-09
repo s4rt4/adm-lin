@@ -200,6 +200,19 @@ pub fn get(id: u64) -> Option<Row> {
     ROWS.lock().unwrap().iter().find(|r| r.id == id).cloned()
 }
 
+/// Perbarui path output + nama + kategori (mis. setelah koreksi nama).
+pub fn set_output(id: u64, output: PathBuf) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        let name = output
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| r.name.clone());
+        r.category = Category::from_filename(&name);
+        r.name = name;
+        r.output = output;
+    }
+}
+
 /// Pindahkan baris ke kategori lain (output baru sudah dihitung pemanggil).
 pub fn move_category(id: u64, output: PathBuf, category: Category) {
     if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
