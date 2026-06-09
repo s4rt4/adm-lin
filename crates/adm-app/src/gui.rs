@@ -82,7 +82,6 @@ const ID_ADD: usize = 0x100;
 const ID_ADD_BATCH: usize = 0x101;
 const ID_ADD_BATCH_CLIP: usize = 0x102;
 const ID_SITE_GRABBER: usize = 0x103;
-const ID_DROP_TARGET: usize = 0x104;
 const ID_EXPORT: usize = 0x105;
 const ID_IMPORT: usize = 0x106;
 const ID_EXIT: usize = 0x107;
@@ -576,7 +575,6 @@ unsafe fn build_menus() {
     append(tasks, ID_ADD_BATCH, w!("Add batch download..."));
     append(tasks, ID_ADD_BATCH_CLIP, w!("Add batch download from clipboard"));
     append(tasks, ID_SITE_GRABBER, w!("Run site grabber..."));
-    append(tasks, ID_DROP_TARGET, w!("Show drop target"));
     sep(tasks);
     append(tasks, ID_EXPORT, w!("Export..."));
     append(tasks, ID_IMPORT, w!("Import..."));
@@ -997,8 +995,9 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
         ID_UPDATES => {
             ShellExecuteW(None, w!("open"), w!("https://github.com/s4rt4/adm-win"), None, None, SW_SHOWNORMAL);
         }
-        ID_DROP_TARGET | ID_ARRANGE | ID_TOOLBAR | ID_TRAY_ICON | ID_CUSTOMIZE | ID_FONT
-        | ID_LANGUAGE => info(hwnd, "Menyusul."),
+        ID_ARRANGE | ID_TOOLBAR | ID_TRAY_ICON | ID_CUSTOMIZE | ID_FONT | ID_LANGUAGE => {
+            info(hwnd, "Menyusul.")
+        }
         // Tray.
         ID_TRAY_SHOW => toggle_window(hwnd),
         ID_TRAY_AUTOSTART => {
