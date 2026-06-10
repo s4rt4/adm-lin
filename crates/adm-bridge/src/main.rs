@@ -71,6 +71,7 @@ async fn handle(msg: serde_json::Value) -> serde_json::Value {
         referrer: msg.get("referrer").and_then(|v| v.as_str()).map(String::from),
         user_agent: msg.get("userAgent").and_then(|v| v.as_str()).map(String::from),
         cookies: msg.get("cookies").and_then(|v| v.as_str()).map(String::from),
+        ..Default::default()
     };
 
     if !ensure_app().await {

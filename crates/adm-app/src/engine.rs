@@ -132,11 +132,12 @@ impl EngineHandle {
         id
     }
 
-    /// Lanjutkan unduhan yang sudah ada (segera).
-    pub fn resume(&self, id: u64, url: String, filename: String) {
+    /// Lanjutkan unduhan yang sudah ada (segera). `insecure` mengabaikan
+    /// verifikasi sertifikat TLS (server bersertifikat invalid).
+    pub fn resume(&self, id: u64, url: String, filename: String, insecure: bool) {
         self.start(
             id,
-            DownloadAddParams { url, filename: Some(filename), ..Default::default() },
+            DownloadAddParams { url, filename: Some(filename), insecure, ..Default::default() },
             false,
         );
     }
@@ -248,6 +249,7 @@ impl EngineHandle {
                 url: params.url.clone(),
                 output,
                 connections: 8,
+                insecure: params.insecure,
             };
             let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
             this.active.lock().unwrap().remove(&id);

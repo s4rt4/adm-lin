@@ -486,7 +486,7 @@ extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                                         e.cancel(did);
                                     } else {
                                         let f = r.filename();
-                                        e.resume(did, r.url, f);
+                                        e.resume(did, r.url, f, r.insecure);
                                     }
                                 }
                             }

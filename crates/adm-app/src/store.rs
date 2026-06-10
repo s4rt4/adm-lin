@@ -48,6 +48,12 @@ pub struct Row {
     /// Popup "Download failed" sudah ditampilkan untuk kegagalan terakhir.
     #[serde(skip)]
     pub failed_announced: bool,
+    /// Abaikan verifikasi sertifikat TLS untuk unduhan ini (user terima risiko).
+    #[serde(default)]
+    pub insecure: bool,
+    /// Pesan error terakhir (transien) — untuk membedakan jenis kegagalan.
+    #[serde(skip)]
+    pub last_error: Option<String>,
     pub category: Category,
 }
 
@@ -114,6 +120,7 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
         r.category = category;
         r.status = Status::Downloading;
         r.failed_announced = false; // mulai lagi → kegagalan berikutnya diumumkan
+        r.last_error = None;
     } else {
         rows.push(Row {
             id,
@@ -127,6 +134,8 @@ pub fn on_started(id: u64, url: String, output: PathBuf) {
             segments: Vec::new(),
             complete_announced: false,
             failed_announced: false,
+            insecure: false,
+            last_error: None,
             category,
         });
     }
@@ -155,6 +164,8 @@ pub fn on_queued(id: u64, url: String, output: PathBuf) {
         segments: Vec::new(),
         complete_announced: false,
         failed_announced: false,
+        insecure: false,
+        last_error: None,
         category,
     });
 }
@@ -208,6 +219,22 @@ pub fn set_status(id: u64, status: Status) {
     if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
         r.status = status;
         r.speed_bps = 0;
+    }
+}
+
+/// Tandai gagal + simpan pesan error (untuk membedakan jenis kegagalan).
+pub fn set_error(id: u64, msg: String) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.status = Status::Error;
+        r.speed_bps = 0;
+        r.last_error = Some(msg);
+    }
+}
+
+/// Setel/atur ulang flag "abaikan sertifikat TLS" untuk satu unduhan.
+pub fn set_insecure(id: u64, val: bool) {
+    if let Some(r) = ROWS.lock().unwrap().iter_mut().find(|r| r.id == id) {
+        r.insecure = val;
     }
 }
 

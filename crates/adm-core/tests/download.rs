@@ -143,6 +143,7 @@ async fn multi_connection_checksum() {
         url: format!("{base}/file.bin"),
         output: out.clone(),
         connections: 8,
+        insecure: false,
     };
     let outcome = download(req, CancelToken::new(), None, unlimited(), unlimited())
         .await
@@ -178,6 +179,7 @@ async fn resume_after_cancel() {
         url: url.clone(),
         output: out.clone(),
         connections: 4,
+        insecure: false,
     };
     // batasi 512 KiB/s lewat per-limiter agar cancel sempat di tengah.
     let per = Arc::new(Limiter::new(512 * 1024));
@@ -194,6 +196,7 @@ async fn resume_after_cancel() {
         url,
         output: out.clone(),
         connections: 4,
+        insecure: false,
     };
     let o2 = download(req2, CancelToken::new(), None, unlimited(), unlimited())
         .await
@@ -216,6 +219,7 @@ async fn fallback_no_range() {
         url: format!("{base}/norange.bin"), // server abaikan Range
         output: out.clone(),
         connections: 8, // diminta 8, tapi engine harus fallback ke 1
+        insecure: false,
     };
     let outcome = download(req, CancelToken::new(), None, unlimited(), unlimited())
         .await

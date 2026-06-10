@@ -36,6 +36,8 @@ pub struct DownloadRequest {
     pub output: PathBuf,
     /// jumlah koneksi yang diinginkan (di-clamp ke [1, 64]).
     pub connections: usize,
+    /// Abaikan verifikasi sertifikat TLS (server bersertifikat invalid).
+    pub insecure: bool,
 }
 
 /// Snapshot progres untuk callback.
@@ -85,25 +87,29 @@ impl SegState {
     }
 }
 
-fn build_client() -> Result<Client> {
-    Ok(Client::builder()
+fn build_client(insecure: bool) -> Result<Client> {
+    let mut b = Client::builder()
         .user_agent(concat!("ADM/", env!("CARGO_PKG_VERSION")))
         // Jangan simpan koneksi idle (probe singkat tak meninggalkan keep-alive
         // yang menggantung; tiap segmen pakai koneksi sendiri).
-        .pool_max_idle_per_host(0)
-        .build()?)
+        .pool_max_idle_per_host(0);
+    if insecure {
+        // User memilih "terima risiko": jangan verifikasi sertifikat TLS.
+        b = b.danger_accept_invalid_certs(true);
+    }
+    Ok(b.build()?)
 }
 
 /// Probe ringan satu URL (bangun client sendiri) — untuk resolusi nama berkas
 /// (Content-Disposition) sebelum mulai mengunduh.
 pub async fn probe_url(url: &str) -> Result<probe::Probe> {
-    let client = build_client()?;
+    let client = build_client(false)?;
     probe::probe(&client, url).await
 }
 
 /// Unduh isi sebuah halaman sebagai teks (dipakai site grabber).
 pub async fn fetch_text(url: &str) -> Result<String> {
-    let client = build_client()?;
+    let client = build_client(false)?;
     let resp = client.get(url).send().await?.error_for_status()?;
     Ok(resp.text().await?)
 }
@@ -117,7 +123,7 @@ pub async fn download(
     per_limiter: Arc<Limiter>,
     global_limiter: Arc<Limiter>,
 ) -> Result<Outcome> {
-    let client = build_client()?;
+    let client = build_client(req.insecure)?;
     let pr = probe::probe(&client, &req.url).await?;
     let sidecar_path = sidecar::path_for(&req.output);
 

@@ -237,7 +237,7 @@ pub fn make_sink() -> EventSink {
             }
             EngineEvent::Failed { id, error } => {
                 eprintln!("[engine] #{id} GAGAL: {error}");
-                store::set_status(id, store::Status::Error);
+                store::set_error(id, error);
                 store::save();
             }
         }
@@ -938,7 +938,7 @@ unsafe fn handle_command(hwnd: HWND, id: usize) {
             if let (Some(id), Some(e)) = (selected_id(), ENGINE.get()) {
                 if let Some(r) = store::get(id) {
                     let fname = r.filename();
-                    e.resume(id, r.url, fname);
+                    e.resume(id, r.url, fname, r.insecure);
                     refresh_ui(hwnd);
                     crate::progress::open(hwnd, id); // dialog status muncul lagi
                 }
@@ -1310,14 +1310,56 @@ unsafe fn do_refresh_link(hwnd: HWND, id: u64) {
         if new_url.is_empty() || new_url == row.url {
             return;
         }
-        e.resume(id, new_url, row.filename());
+        e.resume(id, new_url, row.filename(), row.insecure);
         refresh_ui(hwnd);
         crate::progress::open(hwnd, id);
     }
 }
 
-/// Popup saat unduhan gagal (link kedaluwarsa dll). Tawarkan Refresh Link.
+/// Apakah pesan error menandakan masalah sertifikat TLS.
+fn is_tls_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("certificate")
+        || m.contains("cert ")
+        || m.contains("tls")
+        || m.contains("ssl")
+        || m.contains("invalidcertificate")
+        || m.contains("unknownissuer")
+        || m.contains("notvalidforname")
+}
+
+/// Mengunduh ulang item dengan verifikasi sertifikat dimatikan (terima risiko).
+unsafe fn do_download_insecure(hwnd: HWND, id: u64) {
+    let Some(row) = store::get(id) else { return };
+    let Some(e) = ENGINE.get() else { return };
+    store::set_insecure(id, true);
+    store::save();
+    let fname = row.filename();
+    e.resume(id, row.url, fname, true);
+    refresh_ui(hwnd);
+    crate::progress::open(hwnd, id);
+}
+
+/// Popup saat unduhan gagal. Bila error sertifikat TLS → tawarkan unduh dengan
+/// "terima risiko"; selain itu → tawarkan Refresh Link (link kedaluwarsa dll).
 unsafe fn show_failed_popup(hwnd: HWND, row: &store::Row) {
+    let err = row.last_error.clone().unwrap_or_default();
+    if is_tls_error(&err) {
+        let msg = HSTRING::from(format!(
+            "Download gagal (masalah sertifikat SSL):\n{}\n\nSertifikat server tidak tepercaya/invalid. Anda bisa tetap mengunduh dengan mengabaikan verifikasi sertifikat (risiko keamanan Anda yang tanggung).\n\nUnduh tetap (terima risiko)?",
+            row.filename()
+        ));
+        let r = MessageBoxW(
+            Some(hwnd),
+            PCWSTR(msg.as_ptr()),
+            w!("SSL certificate problem"),
+            MB_YESNO | MB_ICONWARNING,
+        );
+        if r == IDYES {
+            do_download_insecure(hwnd, row.id);
+        }
+        return;
+    }
     let msg = HSTRING::from(format!(
         "Download gagal:\n{}\n\nLink mungkin sudah kedaluwarsa. Buka tautan asli, salin link baru, lalu masukkan di sini. Unduhan akan dilanjutkan dari posisi terakhir.\n\nRefresh link sekarang?",
         row.filename()
@@ -1345,7 +1387,7 @@ unsafe fn do_redownload(hwnd: HWND) {
     sidecar.push(".adm");
     let _ = std::fs::remove_file(sidecar);
     let fname = row.filename();
-    e.resume(id, row.url, fname);
+    e.resume(id, row.url, fname, row.insecure);
     refresh_ui(hwnd);
     crate::progress::open(hwnd, id);
 }

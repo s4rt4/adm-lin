@@ -97,6 +97,9 @@ pub struct DownloadAddParams {
     pub filename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies: Option<String>,
+    /// Abaikan verifikasi sertifikat TLS (saat user memilih "terima risiko").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure: bool,
 }
 
 /// Tulis satu pesan ber-framing `Content-Length: N\r\n\r\n<body>`.
