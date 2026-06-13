@@ -5,6 +5,7 @@ members = [
     "crates/adm-ipc",
     "crates/adm-app",
     "crates/adm-bridge",
+    "crates/adm-egui",
 ]
 
 [workspace.package]

@@ -1,0 +1,21 @@
+[package]
+name = "adm-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ADM Linux app: egui GUI + in-process engine (Fedora/GNOME port)."
+
+[[bin]]
+name = "adm-egui"
+path = "src/main.rs"
+
+[dependencies]
+adm-core = { path = "../adm-core" }
+adm-ipc = { path = "../adm-ipc" }
+eframe = "0.34"
+egui_extras = { version = "0.34", features = ["svg"] }
+resvg = "0.45"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
