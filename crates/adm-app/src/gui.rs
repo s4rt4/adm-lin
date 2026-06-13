@@ -1596,7 +1596,8 @@ fn set_status_bar(text: &str) {
             SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0x1000)), Some(LPARAM(0)));
         } else {
             SendMessageW(sb, SB_SETBKCOLOR, Some(WPARAM(0)), Some(LPARAM(CLR_DEFAULT as isize)));
-            let h = HSTRING::from(text);
+            // Beri sedikit jarak kiri agar teks tak mepet tepi.
+            let h = HSTRING::from(format!("  {text}"));
             SendMessageW(sb, SB_SETTEXTW, Some(WPARAM(0)), Some(LPARAM(h.as_ptr() as isize)));
         }
         let _ = InvalidateRect(Some(sb), None, true);
