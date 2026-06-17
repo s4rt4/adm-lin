@@ -70,7 +70,7 @@ fn store_file() -> PathBuf {
     data_dir().join("downloads.json")
 }
 
-fn data_dir() -> PathBuf {
+pub(crate) fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .ok()
         .filter(|s| !s.is_empty())

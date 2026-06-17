@@ -2,9 +2,11 @@
 //! (`adm-app/gui.rs`): menu bar, toolbar tombol, sidebar pohon kategori,
 //! tabel unduhan multi-kolom, status bar. Engine `adm-core` jalan in-process.
 
+mod autostart;
 mod category;
 mod engine;
 mod ipc;
+mod settings;
 mod store;
 mod tray;
 
@@ -177,6 +179,7 @@ struct AdmApp {
     opt_dir: String,
     opt_queue_max: usize,
     opt_limit_kbps: u64,
+    opt_autostart: bool,
     // Dialog About.
     show_about: bool,
     // Dialog Refresh Link (id baris target + buffer URL baru).
@@ -186,13 +189,19 @@ struct AdmApp {
     /// tutup jendela: ada tray → sembunyikan ke tray; tanpa tray (mis. GNOME
     /// polos) → minimize ke dock agar jendela selalu bisa dipanggil kembali.
     tray_active: Arc<AtomicBool>,
+    /// Tema gelap (palet One Dark) aktif. Dipersist di settings.json.
+    dark: bool,
 }
 
 impl AdmApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // ADM hanya mendukung light theme — kunci agar tak ikut tema sistem.
+        // Setelan persist (tema, folder, antrian, limit).
+        let cfg = settings::load();
+        // Tema dikunci ke pilihan app (tak ikut sistem); terang / One Dark.
         cc.egui_ctx.set_theme(egui::ThemePreference::Light);
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        apply_theme(&cc.egui_ctx, cfg.dark);
+        // Font lebih tebal + ukuran teks/kontrol/padding lebih lega.
+        configure_style(&cc.egui_ctx);
         // Loader gambar (untuk ikon toolbar SVG Lucide).
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
@@ -208,8 +217,14 @@ impl AdmApp {
             ctx.request_repaint();
         });
 
-        let download_dir = default_download_dir();
+        let download_dir = cfg
+            .download_dir
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(default_download_dir);
         let engine = EngineHandle::new(rt.handle().clone(), download_dir.clone(), sink);
+        engine.set_queue_max(cfg.queue_max);
+        engine.set_global_limit(cfg.limit_kbps * 1024);
 
         // Server IPC bridge→app (native messaging + single-instance activate).
         let (ipc_tx, ipc_rx) = mpsc::channel::<IpcCommand>();
@@ -248,13 +263,36 @@ impl AdmApp {
             pending_add: None,
             show_options: false,
             opt_dir,
-            opt_queue_max: 1,
-            opt_limit_kbps: 0,
+            opt_queue_max: cfg.queue_max,
+            opt_limit_kbps: cfg.limit_kbps,
+            opt_autostart: false,
             show_about: false,
             refresh_target: None,
             refresh_url: String::new(),
             tray_active,
+            dark: cfg.dark,
         }
+    }
+
+    /// Tulis setelan terkini ke disk.
+    fn save_settings(&self) {
+        settings::save(&settings::Settings {
+            dark: self.dark,
+            download_dir: Some(self.download_dir.display().to_string()),
+            queue_max: self.opt_queue_max,
+            limit_kbps: self.opt_limit_kbps,
+        });
+    }
+
+    /// Ganti tema (terang ⇄ One Dark), terapkan ke konteks, lalu persist.
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        if self.dark == dark {
+            return;
+        }
+        self.dark = dark;
+        apply_theme(ctx, dark);
+        configure_style(ctx); // pertahankan font/ukuran setelah ganti visuals
+        self.save_settings();
     }
 
     /// Tombol tutup jendela: jangan keluar — beradaptasi dgn lingkungan.
@@ -515,9 +553,10 @@ impl AdmApp {
         store::save(&self.rows);
     }
 
-    /// Buka dialog Options dengan folder unduhan terkini terisi.
+    /// Buka dialog Options dengan folder unduhan & status autostart terkini.
     fn open_options(&mut self) {
         self.opt_dir = self.download_dir.display().to_string();
+        self.opt_autostart = autostart::is_enabled();
         self.show_options = true;
     }
 
@@ -540,6 +579,11 @@ impl AdmApp {
         }
         self.engine.set_queue_max(self.opt_queue_max);
         self.engine.set_global_limit(self.opt_limit_kbps * 1024);
+        // Autostart hanya ditulis bila status berubah dari kondisi di disk.
+        if self.opt_autostart != autostart::is_enabled() {
+            autostart::set(self.opt_autostart);
+        }
+        self.save_settings();
     }
 
     /// Refresh Link: ganti URL baris terpilih lalu lanjutkan unduhan dengan URL baru.
@@ -672,6 +716,12 @@ impl AdmApp {
 
                 // ---- View ----
                 ui.menu_button("View", |ui| {
+                    let mut dark = self.dark;
+                    if ui.checkbox(&mut dark, "Dark mode (One Dark)").clicked() {
+                        self.set_dark(ui.ctx(), dark);
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.add_enabled(false, egui::Button::new("Hide categories"));
                     ui.add_enabled(false, egui::Button::new("Arrange files"));
                     ui.add_enabled(false, egui::Button::new("Toolbar"));
@@ -822,7 +872,7 @@ impl AdmApp {
                 .column(Column::initial(110.0).at_least(70.0)) // Transfer rate
                 .column(Column::initial(130.0).at_least(80.0)) // Last Try
                 .column(Column::remainder().at_least(80.0)) // Description
-                .header(22.0, |mut h| {
+                .header(26.0, |mut h| {
                     for title in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Last Try", "Description"] {
                         h.col(|ui| {
                             ui.strong(title);
@@ -833,7 +883,7 @@ impl AdmApp {
                     for &i in &visible {
                         let r = &self.rows[i];
                         let is_sel = self.selected == Some(r.id);
-                        body.row(22.0, |mut row| {
+                        body.row(26.0, |mut row| {
                             row.set_selected(is_sel);
                             row.col(|ui| {
                                 ui.label(&r.filename);
@@ -929,8 +979,13 @@ impl AdmApp {
                 });
 
             // Garis tipis pemisah antar-baris (gaya list IDM).
+            let line_color = if ui.visuals().dark_mode {
+                egui::Color32::from_gray(58)
+            } else {
+                egui::Color32::from_gray(222)
+            };
             let painter = ui.painter();
-            let stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(222));
+            let stroke = egui::Stroke::new(1.0, line_color);
             for rect in &row_rects {
                 painter.hline(rect.x_range(), rect.bottom(), stroke);
             }
@@ -1033,6 +1088,10 @@ impl AdmApp {
                             }
                         });
                     ui.end_row();
+
+                    ui.label("Run at login:");
+                    ui.checkbox(&mut self.opt_autostart, "Start ADM when I log in");
+                    ui.end_row();
                 });
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1125,10 +1184,10 @@ impl AdmApp {
 /// Tombol toolbar gaya IDM: ikon besar di atas, teks di bawah (vertikal).
 /// Lebar menyesuaikan teks; `enabled=false` → ikon & teks dipudarkan.
 fn tbtn(ui: &mut egui::Ui, src: egui::ImageSource<'static>, label: &str, enabled: bool) -> bool {
-    const ICON: f32 = 24.0;
-    const FONT: f32 = 10.5;
-    const PAD_X: f32 = 8.0;
-    const H: f32 = 52.0;
+    const ICON: f32 = 26.0;
+    const FONT: f32 = 13.0;
+    const PAD_X: f32 = 10.0;
+    const H: f32 = 62.0;
 
     let font = egui::FontId::proportional(FONT);
     let text_w = ui
@@ -1156,11 +1215,14 @@ fn tbtn(ui: &mut egui::Ui, src: egui::ImageSource<'static>, label: &str, enabled
         egui::pos2(rect.center().x - ICON / 2.0, rect.top() + 6.0),
         egui::vec2(ICON, ICON),
     );
-    let tint = if enabled {
-        egui::Color32::WHITE
+    // Ikon SVG berstroke putih → tint mengatur warna akhir. Gelap di tema
+    // terang; terang di tema gelap. Dipudarkan saat disabled.
+    let base = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0xab, 0xb2, 0xbf)
     } else {
-        egui::Color32::from_white_alpha(70)
+        egui::Color32::from_gray(43)
     };
+    let tint = if enabled { base } else { base.gamma_multiply(0.38) };
     egui::Image::new(src).tint(tint).paint_at(ui, icon_rect);
 
     // Teks di bawah ikon.
@@ -1250,6 +1312,107 @@ fn fmt_duration(secs: u64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// Setel font + ukuran teks/kontrol + padding dialog. Default egui terlalu
+/// kecil & tipis untuk gaya IDM; kita perbesar dan pakai font sistem yg tegas.
+fn configure_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    install_fonts(ctx);
+
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Small, FontId::new(12.5, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new(21.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace)),
+    ]
+    .into();
+    // Kontrol lebih besar & lega.
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.interact_size.y = 28.0;
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    // Padding isi semua jendela dialog (Window) agar tak mepet tepi.
+    style.spacing.window_margin = egui::Margin::same(16);
+    ctx.set_style(style);
+}
+
+/// Terapkan tema terang atau gelap (One Dark) ke konteks.
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    if dark {
+        ctx.set_visuals(one_dark_visuals());
+    } else {
+        ctx.set_visuals(egui::Visuals::light());
+    }
+}
+
+/// Palet gelap bergaya **Atom One Dark** (populer). Dibangun dari `Visuals::dark`
+/// lalu menimpa warna kunci agar konsisten dengan One Dark.
+fn one_dark_visuals() -> egui::Visuals {
+    use egui::{Color32, Stroke};
+    let base = Color32::from_rgb(40, 44, 52); // #282c34
+    let panel = Color32::from_rgb(33, 37, 43); // #21252b
+    let widget = Color32::from_rgb(44, 49, 58); // #2c313a
+    let hovered = Color32::from_rgb(58, 63, 75); // #3a3f4b
+    let active = Color32::from_rgb(62, 68, 81); // #3e4451
+    let fg = Color32::from_rgb(171, 178, 191); // #abb2bf
+    let fg_bright = Color32::from_rgb(215, 218, 224);
+    let accent = Color32::from_rgb(97, 175, 239); // #61afef
+
+    let mut v = egui::Visuals::dark();
+    v.dark_mode = true;
+    v.override_text_color = Some(fg);
+    v.panel_fill = panel;
+    v.window_fill = base;
+    v.extreme_bg_color = Color32::from_rgb(27, 30, 36); // bg text edit
+    v.faint_bg_color = Color32::from_rgb(36, 40, 48);
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(24, 26, 31));
+    v.selection.bg_fill = active;
+    v.selection.stroke = Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+
+    let w = &mut v.widgets;
+    w.noninteractive.bg_fill = panel;
+    w.noninteractive.weak_bg_fill = panel;
+    w.noninteractive.fg_stroke = Stroke::new(1.0, fg);
+    w.inactive.bg_fill = widget;
+    w.inactive.weak_bg_fill = widget;
+    w.inactive.fg_stroke = Stroke::new(1.0, fg);
+    w.hovered.bg_fill = hovered;
+    w.hovered.weak_bg_fill = hovered;
+    w.hovered.fg_stroke = Stroke::new(1.5, fg_bright);
+    w.active.bg_fill = active;
+    w.active.weak_bg_fill = active;
+    w.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    v
+}
+
+/// Pasang font sistem yang lebih tebal (Noto Sans / DejaVu) sebagai font utama
+/// proporsional. Bila tak ada satupun ditemukan, biarkan default egui.
+fn install_fonts(ctx: &egui::Context) {
+    // HANYA font statik — ab_glyph (backend egui) bisa hang pada variable font
+    // seperti `NotoSans[wght].ttf`. Liberation Sans / Cantarell tegas & umum di
+    // Fedora; DejaVu sebagai cadangan.
+    const CANDIDATES: &[&str] = &[
+        "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("system-sans".to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "system-sans".to_owned());
+    ctx.set_fonts(fonts);
 }
 
 /// Buka berkas/folder dengan handler default desktop (`xdg-open`), terlepas.
