@@ -377,3 +377,134 @@ fn sanitize(name: &str) -> String {
         .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+    use tiny_http::{Header, Response, Server, StatusCode};
+
+    /// Server HTTP lokal dengan dukungan Range; mati saat guard di-drop.
+    struct ServerGuard {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            for t in self.threads.drain(..) {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn start_server(payload: Arc<Vec<u8>>) -> (String, ServerGuard) {
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let (server, payload, stop) = (server.clone(), payload.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || loop {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match server.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Some(req)) => handle(req, &payload),
+                    Ok(None) => continue,
+                    Err(_) => break,
+                }
+            }));
+        }
+        (base, ServerGuard { stop, threads })
+    }
+
+    fn handle(req: tiny_http::Request, payload: &[u8]) {
+        let total = payload.len() as u64;
+        let range = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Range"))
+            .and_then(|h| h.value.as_str().strip_prefix("bytes=").map(str::to_owned));
+        let accept = Header::from_bytes(&b"Accept-Ranges"[..], &b"bytes"[..]).unwrap();
+        match range.as_deref().and_then(|r| {
+            let (a, b) = r.split_once('-')?;
+            let a: u64 = a.trim().parse().ok()?;
+            let b = if b.trim().is_empty() { total - 1 } else { b.trim().parse().ok()? };
+            Some((a.min(total - 1), b.min(total - 1)))
+        }) {
+            Some((a, b)) => {
+                let slice = payload[a as usize..=b as usize].to_vec();
+                let cr = format!("bytes {a}-{b}/{total}");
+                let _ = req.respond(
+                    Response::from_data(slice)
+                        .with_status_code(StatusCode(206))
+                        .with_header(Header::from_bytes(&b"Content-Range"[..], cr.as_bytes()).unwrap())
+                        .with_header(accept),
+                );
+            }
+            None => {
+                let _ = req.respond(Response::from_data(payload.to_vec()).with_header(accept));
+            }
+        }
+    }
+
+    /// E2e lapisan EngineHandle: add → event Started/Progress/Completed, dan
+    /// berkas tertulis ke subfolder kategori yang benar (.mkv → Video/).
+    #[test]
+    fn engine_download_emits_events_and_routes_category() {
+        let payload = Arc::new((0..1_000_000u32).map(|i| (i & 0xff) as u8).collect::<Vec<u8>>());
+        let (base, _srv) = start_server(payload.clone());
+
+        let dir = std::env::temp_dir().join(format!("adm-egui-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let events: Arc<Mutex<Vec<EngineEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let sink: EventSink = Arc::new(move |e| ev.lock().unwrap().push(e));
+        let engine = EngineHandle::new(rt.handle().clone(), dir.clone(), sink);
+
+        engine.add(DownloadAddParams {
+            url: format!("{base}/movie.mkv"),
+            filename: Some("movie.mkv".into()),
+            ..Default::default()
+        });
+
+        // Tunggu event Completed (maks 15 dtk).
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let completed = loop {
+            if let Some(b) = events.lock().unwrap().iter().find_map(|e| match e {
+                EngineEvent::Completed { bytes, .. } => Some(*bytes),
+                _ => None,
+            }) {
+                break Some(b);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let evs = events.lock().unwrap();
+        assert!(
+            matches!(evs.first(), Some(EngineEvent::Started { .. })),
+            "event pertama harus Started, dapat {:?}",
+            evs.first()
+        );
+        assert!(
+            evs.iter().any(|e| matches!(e, EngineEvent::Progress { .. })),
+            "harus ada minimal satu event Progress"
+        );
+        assert_eq!(completed, Some(payload.len() as u64), "Completed dgn ukuran penuh");
+
+        // Kategori .mkv → subfolder Video.
+        let out = dir.join("Video").join("movie.mkv");
+        assert!(out.exists(), "berkas harus ada di {out:?}");
+        assert_eq!(std::fs::read(&out).unwrap(), *payload, "isi berkas harus utuh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

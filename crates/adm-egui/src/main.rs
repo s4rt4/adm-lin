@@ -4,6 +4,7 @@
 
 mod category;
 mod engine;
+mod store;
 
 use category::Category;
 use eframe::egui;
@@ -86,7 +87,7 @@ enum Filter {
     Grabber,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 enum Status {
     Queued,
     Active,
@@ -171,13 +172,24 @@ impl AdmApp {
         let download_dir = default_download_dir();
         let engine = EngineHandle::new(rt.handle().clone(), download_dir.clone(), sink);
 
+        // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
+        let (rows, max_id) = store::load();
+        if max_id > 0 {
+            engine.reserve_ids(max_id + 1);
+        }
+        let index = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.id, i))
+            .collect();
+
         Self {
             _rt: rt,
             engine,
             rx,
             download_dir,
-            rows: Vec::new(),
-            index: HashMap::new(),
+            rows,
+            index,
             filter: Filter::All,
             selected: None,
             show_add: false,
@@ -186,18 +198,24 @@ impl AdmApp {
     }
 
     fn drain_events(&mut self) {
+        // Tandai bila ada perubahan struktural (bukan sekadar progress) agar
+        // daftar dipersist sekali di akhir, bukan tiap event progress.
+        let mut dirty = false;
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 EngineEvent::Queued { id, url, output } => {
-                    self.upsert(id, url, output, Status::Queued)
+                    self.upsert(id, url, output, Status::Queued);
+                    dirty = true;
                 }
                 EngineEvent::Started { id, url, output } => {
-                    self.upsert(id, url, output, Status::Active)
+                    self.upsert(id, url, output, Status::Active);
+                    dirty = true;
                 }
                 EngineEvent::Renamed { id, output } => {
                     if let Some(&i) = self.index.get(&id) {
                         self.rows[i].filename = filename_of(&output);
                         self.rows[i].category = Category::from_filename(&self.rows[i].filename);
+                        dirty = true;
                     }
                 }
                 EngineEvent::Progress {
@@ -226,6 +244,7 @@ impl AdmApp {
                         }
                         r.speed_bps = 0;
                         r.status = Status::Completed;
+                        dirty = true;
                     }
                 }
                 EngineEvent::Paused { id, downloaded } => {
@@ -234,6 +253,7 @@ impl AdmApp {
                         r.downloaded = downloaded;
                         r.speed_bps = 0;
                         r.status = Status::Paused;
+                        dirty = true;
                     }
                 }
                 EngineEvent::Failed { id, error } => {
@@ -242,9 +262,13 @@ impl AdmApp {
                         r.speed_bps = 0;
                         r.status = Status::Failed;
                         r.error = Some(error);
+                        dirty = true;
                     }
                 }
             }
+        }
+        if dirty {
+            store::save(&self.rows);
         }
     }
 
@@ -337,6 +361,7 @@ impl AdmApp {
             for (i, r) in self.rows.iter().enumerate() {
                 self.index.insert(r.id, i);
             }
+            store::save(&self.rows);
         }
     }
 }
