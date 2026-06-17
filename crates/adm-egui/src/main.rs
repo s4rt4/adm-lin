@@ -94,6 +94,17 @@ enum Filter {
     Grabber,
 }
 
+/// Aksi yang dipicu dari context-menu / double-click pada baris tabel.
+/// Dikumpulkan saat render lalu dieksekusi setelah tabel (hindari borrow ganda).
+enum RowAction {
+    Open,
+    OpenFolder,
+    Resume,
+    Stop,
+    Delete,
+    Move(Category),
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 enum Status {
     Queued,
@@ -158,6 +169,16 @@ struct AdmApp {
     /// Metadata titipan browser (referrer/UA/cookie) untuk add via IPC; dipakai
     /// saat dialog Add dikonfirmasi agar header tak hilang.
     pending_add: Option<adm_ipc::DownloadAddParams>,
+    // Dialog Options.
+    show_options: bool,
+    opt_dir: String,
+    opt_queue_max: usize,
+    opt_limit_kbps: u64,
+    // Dialog About.
+    show_about: bool,
+    // Dialog Refresh Link (id baris target + buffer URL baru).
+    refresh_target: Option<u64>,
+    refresh_url: String,
 }
 
 impl AdmApp {
@@ -199,6 +220,7 @@ impl AdmApp {
             .enumerate()
             .map(|(i, r)| (r.id, i))
             .collect();
+        let opt_dir = download_dir.display().to_string();
 
         Self {
             _rt: rt,
@@ -213,6 +235,13 @@ impl AdmApp {
             show_add: false,
             add_url: String::new(),
             pending_add: None,
+            show_options: false,
+            opt_dir,
+            opt_queue_max: 1,
+            opt_limit_kbps: 0,
+            show_about: false,
+            refresh_target: None,
+            refresh_url: String::new(),
         }
     }
 
@@ -404,6 +433,103 @@ impl AdmApp {
             store::save(&self.rows);
         }
     }
+
+    /// Path berkas baris = folder unduhan [/ subfolder kategori] / nama berkas.
+    /// (Engine menulis ke lokasi ini; baris tak menyimpan path penuh.)
+    fn row_path(&self, r: &Row) -> PathBuf {
+        let mut dir = self.download_dir.clone();
+        if let Some(folder) = r.category.folder() {
+            dir.push(folder);
+        }
+        dir.join(&r.filename)
+    }
+
+    /// Jalankan aksi context-menu/double-click pada satu baris.
+    fn do_row_action(&mut self, id: u64, action: RowAction) {
+        let Some(&i) = self.index.get(&id) else { return };
+        match action {
+            RowAction::Open => open_path(&self.row_path(&self.rows[i])),
+            RowAction::OpenFolder => {
+                if let Some(parent) = self.row_path(&self.rows[i]).parent() {
+                    open_path(parent);
+                }
+            }
+            RowAction::Resume => {
+                self.selected = Some(id);
+                self.resume_selected();
+            }
+            RowAction::Stop => self.engine.cancel(id),
+            RowAction::Delete => {
+                self.selected = Some(id);
+                self.delete_selected();
+            }
+            RowAction::Move(cat) => self.move_category(id, cat),
+        }
+    }
+
+    /// Pindahkan baris ke kategori lain: pindahkan berkas ke subfolder kategori
+    /// baru (bila ada di disk) lalu perbarui baris. Persist setelahnya.
+    fn move_category(&mut self, id: u64, cat: Category) {
+        let Some(&i) = self.index.get(&id) else { return };
+        if self.rows[i].category == cat {
+            return;
+        }
+        let old = self.row_path(&self.rows[i]);
+        let mut new_dir = self.download_dir.clone();
+        if let Some(folder) = cat.folder() {
+            new_dir.push(folder);
+        }
+        let new = new_dir.join(&self.rows[i].filename);
+        if old.exists() {
+            let _ = std::fs::create_dir_all(&new_dir);
+            let _ = std::fs::rename(&old, &new);
+        }
+        self.rows[i].category = cat;
+        store::save(&self.rows);
+    }
+
+    /// Buka dialog Options dengan folder unduhan terkini terisi.
+    fn open_options(&mut self) {
+        self.opt_dir = self.download_dir.display().to_string();
+        self.show_options = true;
+    }
+
+    /// Buka dialog Refresh Link untuk baris terpilih (prefill URL saat ini).
+    fn open_refresh(&mut self) {
+        if let Some(r) = self.selected_row() {
+            let (url, id) = (r.url.clone(), r.id);
+            self.refresh_url = url;
+            self.refresh_target = Some(id);
+        }
+    }
+
+    /// Terapkan setelan dari dialog Options ke engine.
+    fn apply_options(&mut self) {
+        let dir = PathBuf::from(self.opt_dir.trim());
+        if !self.opt_dir.trim().is_empty() {
+            let _ = std::fs::create_dir_all(&dir);
+            self.download_dir = dir.clone();
+            self.engine.set_download_dir(dir);
+        }
+        self.engine.set_queue_max(self.opt_queue_max);
+        self.engine.set_global_limit(self.opt_limit_kbps * 1024);
+    }
+
+    /// Refresh Link: ganti URL baris terpilih lalu lanjutkan unduhan dengan URL baru.
+    fn apply_refresh(&mut self) {
+        let Some(id) = self.refresh_target.take() else { return };
+        let url = self.refresh_url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        if let Some(&i) = self.index.get(&id) {
+            self.rows[i].url = url.clone();
+            let filename = self.rows[i].filename.clone();
+            store::save(&self.rows);
+            self.engine.resume(id, url, filename, false);
+        }
+        self.refresh_url.clear();
+    }
 }
 
 impl eframe::App for AdmApp {
@@ -417,6 +543,9 @@ impl eframe::App for AdmApp {
         self.sidebar(ui);
         self.table(ui);
         self.add_dialog(ui);
+        self.options_dialog(ui);
+        self.about_dialog(ui);
+        self.refresh_dialog(ui);
     }
 }
 
@@ -507,7 +636,10 @@ impl AdmApp {
                         }
                     });
                     ui.separator();
-                    ui.add_enabled(false, egui::Button::new("Options..."));
+                    if ui.button("Options...").clicked() {
+                        self.open_options();
+                        ui.close();
+                    }
                 });
 
                 // ---- View ----
@@ -521,7 +653,10 @@ impl AdmApp {
 
                 // ---- Help ----
                 ui.menu_button("Help", |ui| {
-                    ui.add_enabled(false, egui::Button::new("About ADM"));
+                    if ui.button("About ADM").clicked() {
+                        self.show_about = true;
+                        ui.close();
+                    }
                 });
             });
         });
@@ -562,9 +697,13 @@ impl AdmApp {
                     self.delete_completed();
                 }
                 ui.separator();
-                tbtn(ui, icon_options(), "Options", false);
+                if tbtn(ui, icon_options(), "Options", true) {
+                    self.open_options();
+                }
                 tbtn(ui, icon_scheduler(), "Scheduler", false);
-                tbtn(ui, icon_refresh_link(), "Refresh Link", false);
+                if tbtn(ui, icon_refresh_link(), "Refresh Link", has_sel) {
+                    self.open_refresh();
+                }
                 ui.separator();
                 if tbtn(ui, icon_start_queue(), "Start Queue", true) {
                     self.engine.start_queue();
@@ -640,6 +779,7 @@ impl AdmApp {
                 .collect();
 
             let mut clicked: Option<u64> = None;
+            let mut action: Option<(u64, RowAction)> = None;
             let mut row_rects: Vec<egui::Rect> = Vec::new();
             TableBuilder::new(ui)
                 .striped(true)
@@ -707,6 +847,55 @@ impl AdmApp {
                             if resp.clicked() {
                                 clicked = Some(r.id);
                             }
+                            // Double-click membuka berkas (gaya IDM).
+                            if resp.double_clicked() {
+                                action = Some((r.id, RowAction::Open));
+                            }
+                            let (id, status) = (r.id, r.status);
+                            resp.context_menu(|ui| {
+                                clicked = Some(id);
+                                let resumable = matches!(status, Status::Paused | Status::Failed);
+                                if ui.button("Open").clicked() {
+                                    action = Some((id, RowAction::Open));
+                                    ui.close();
+                                }
+                                if ui.button("Open containing folder").clicked() {
+                                    action = Some((id, RowAction::OpenFolder));
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.add_enabled(resumable, egui::Button::new("Resume")).clicked() {
+                                    action = Some((id, RowAction::Resume));
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(status == Status::Active, egui::Button::new("Stop"))
+                                    .clicked()
+                                {
+                                    action = Some((id, RowAction::Stop));
+                                    ui.close();
+                                }
+                                ui.menu_button("Move to category", |ui| {
+                                    for cat in [
+                                        Category::Compressed,
+                                        Category::Documents,
+                                        Category::Music,
+                                        Category::Programs,
+                                        Category::Video,
+                                        Category::General,
+                                    ] {
+                                        if ui.button(cat.label()).clicked() {
+                                            action = Some((id, RowAction::Move(cat)));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                ui.separator();
+                                if ui.button("Delete").clicked() {
+                                    action = Some((id, RowAction::Delete));
+                                    ui.close();
+                                }
+                            });
                         });
                     }
                 });
@@ -720,6 +909,9 @@ impl AdmApp {
 
             if let Some(id) = clicked {
                 self.selected = Some(id);
+            }
+            if let Some((id, act)) = action {
+                self.do_row_action(id, act);
             }
         });
     }
@@ -768,6 +960,136 @@ impl AdmApp {
             if !self.add_url.trim().is_empty() {
                 self.add_download(later);
             }
+        }
+    }
+
+    fn options_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_options {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("Options")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(460.0);
+                egui::Grid::new("opt_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Download folder:");
+                    ui.add(egui::TextEdit::singleline(&mut self.opt_dir).desired_width(300.0));
+                    ui.end_row();
+
+                    ui.label("Max concurrent (queue):");
+                    ui.add(egui::DragValue::new(&mut self.opt_queue_max).range(1..=16));
+                    ui.end_row();
+
+                    ui.label("Speed limit:");
+                    egui::ComboBox::from_id_salt("opt_limit")
+                        .selected_text(if self.opt_limit_kbps == 0 {
+                            "Unlimited".to_string()
+                        } else {
+                            format!("{} KB/s", self.opt_limit_kbps)
+                        })
+                        .show_ui(ui, |ui| {
+                            for (label, kbps) in [
+                                ("Unlimited", 0u64),
+                                ("50 KB/s", 50),
+                                ("100 KB/s", 100),
+                                ("500 KB/s", 500),
+                                ("1 MB/s", 1024),
+                                ("5 MB/s", 5120),
+                            ] {
+                                ui.selectable_value(&mut self.opt_limit_kbps, kbps, label);
+                            }
+                        });
+                    ui.end_row();
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_options = false;
+                    }
+                });
+            });
+        if apply {
+            self.apply_options();
+            self.show_options = false;
+        }
+        if !open {
+            self.show_options = false;
+        }
+    }
+
+    fn about_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_about {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("About ADM")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("../assets/logo.svg"))
+                            .fit_to_exact_size(egui::vec2(72.0, 72.0)),
+                    );
+                    ui.add_space(6.0);
+                    ui.heading("Alpha Download Manager");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("Engine {}", adm_core::version()));
+                    ui.add_space(4.0);
+                    ui.weak("Linux/Fedora port — egui");
+                });
+            });
+        if !open {
+            self.show_about = false;
+        }
+    }
+
+    fn refresh_dialog(&mut self, ui: &mut egui::Ui) {
+        if self.refresh_target.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        egui::Window::new("Refresh Link")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(440.0);
+                ui.label("New address (URL):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.refresh_url)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("https://…"),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Update & Resume").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.refresh_target = None;
+                        self.refresh_url.clear();
+                    }
+                });
+            });
+        if apply {
+            self.apply_refresh();
+        }
+        if !open {
+            self.refresh_target = None;
+            self.refresh_url.clear();
         }
     }
 }
@@ -900,6 +1222,11 @@ fn fmt_duration(secs: u64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// Buka berkas/folder dengan handler default desktop (`xdg-open`), terlepas.
+fn open_path(path: &std::path::Path) {
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
 }
 
 fn filename_of(p: &std::path::Path) -> String {
