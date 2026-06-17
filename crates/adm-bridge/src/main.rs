@@ -1,20 +1,25 @@
-//! adm-bridge — native messaging host (plan §11.2).
+//! adm-bridge — native messaging host (plan §11.2), port Linux.
 //!
 //! Mode:
 //!   (default)            : loop stdio native-messaging (dipanggil browser).
-//!   ping                 : uji koneksi ke adm-app.
+//!   ping                 : uji koneksi ke adm (Unix socket).
 //!   add <url>            : kirim download.add (uji).
-//!   register <chrome-id> [firefox-id] : tulis manifest + registry host.
-//!   unregister           : hapus registry host.
+//!   register <chrome-id> [firefox-id] : tulis manifest host ke direktori
+//!                          NativeMessagingHosts per-browser (XDG).
+//!   unregister           : hapus manifest host.
 //!
 //! Protokol stdio: 4-byte length LE + JSON UTF-8 (Chrome/Edge/Firefox).
 //! Pesan dari extension: {"method":"download.add","url":..,"filename":..}.
+//!
+//! Jalur ke app: **Unix domain socket** `adm_ipc::unix_socket_path()`
+//! (pengganti Named Pipe Windows).
 
-use adm_ipc::{method, Request, Response, DownloadAddParams, PIPE_NAME};
+use adm_ipc::{method, DownloadAddParams, Request, Response};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::BufReader;
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::UnixStream;
 
 const HOST_NAME: &str = "com.adm.bridge";
 
@@ -75,7 +80,7 @@ async fn handle(msg: serde_json::Value) -> serde_json::Value {
     };
 
     if !ensure_app().await {
-        return serde_json::json!({ "ok": false, "error": "adm-app tak bisa dijalankan" });
+        return serde_json::json!({ "ok": false, "error": "adm tak bisa dijalankan" });
     }
 
     match request(method::DOWNLOAD_ADD, Some(serde_json::to_value(&params).unwrap())).await {
@@ -92,28 +97,19 @@ fn write_message(value: &serde_json::Value) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Pastikan adm-app hidup; jika tidak, spawn `adm-app --tray` lalu tunggu.
+/// Pastikan app hidup; jika tidak, spawn `adm-egui` terlepas lalu tunggu PING.
 async fn ensure_app() -> bool {
     if request(method::PING, None).await.is_ok() {
         return true;
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            use std::os::windows::process::CommandExt;
-            use std::process::Stdio;
-            // DETACHED_PROCESS | CREATE_NO_WINDOW: jangan wariskan pipe
-            // native-messaging bridge ke adm-app, dan jangan munculkan console.
-            const DETACHED_PROCESS: u32 = 0x0000_0008;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let app = dir.join("adm-app.exe");
-            let _ = std::process::Command::new(app)
-                .arg("--tray")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
-                .spawn();
-        }
+    if let Some(app) = find_app() {
+        use std::process::Stdio;
+        // Lepaskan stdio agar pipe native-messaging tak diwariskan ke app.
+        let _ = std::process::Command::new(app)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -124,13 +120,23 @@ async fn ensure_app() -> bool {
     false
 }
 
-// ---------------- Pipe client ----------------
+/// Cari binary `adm-egui`: di samping bridge (instalasi), lalu andalkan PATH.
+fn find_app() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("adm-egui");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(PathBuf::from("adm-egui")) // resolusi via PATH
+}
 
-async fn request(
-    method: &str,
-    params: Option<serde_json::Value>,
-) -> std::io::Result<Response> {
-    let client = ClientOptions::new().open(PIPE_NAME)?;
+// ---------------- Unix socket client ----------------
+
+async fn request(method: &str, params: Option<serde_json::Value>) -> std::io::Result<Response> {
+    let client = UnixStream::connect(adm_ipc::unix_socket_path()).await?;
     let mut reader = BufReader::new(client);
     let req = Request::new(1, method, params);
     adm_ipc::write_message(reader.get_mut(), &req).await?;
@@ -138,7 +144,7 @@ async fn request(
         Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            "pipe ditutup sebelum balasan",
+            "socket ditutup sebelum balasan",
         )),
     }
 }
@@ -172,71 +178,77 @@ fn cli_add(args: &[String]) {
     }
 }
 
-// ---------------- Registrasi native messaging host (§11.2) ----------------
+// ---------- Registrasi native messaging host (Linux/XDG, §11.2) ----------
+
+/// `$HOME/<rel>` (helper path config browser).
+fn home_join(rel: &str) -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(rel))
+}
+
+/// Direktori NativeMessagingHosts gaya Chromium (allowed_origins).
+fn chromium_dirs() -> Vec<PathBuf> {
+    [
+        ".config/google-chrome/NativeMessagingHosts",
+        ".config/chromium/NativeMessagingHosts",
+        ".config/microsoft-edge/NativeMessagingHosts",
+    ]
+    .iter()
+    .filter_map(|r| home_join(r))
+    .collect()
+}
+
+/// Direktori NativeMessagingHosts Firefox (allowed_extensions).
+fn firefox_dir() -> Option<PathBuf> {
+    home_join(".mozilla/native-messaging-hosts")
+}
 
 fn register(args: &[String]) {
     let exe = std::env::current_exe().expect("current_exe");
-    let dir = exe.parent().expect("dir").to_path_buf();
-    let chrome_id = args.get(1).cloned().unwrap_or_else(|| {
+    let exe_str = exe.to_string_lossy();
+    let Some(chrome_id) = args.get(1).cloned() else {
         eprintln!("usage: adm-bridge register <chrome/edge-extension-id> [firefox-extension-id]");
         std::process::exit(2);
-    });
-    let firefox_id = args.get(2).cloned();
+    };
 
-    let exe_str = exe.to_string_lossy().replace('\\', "\\\\");
-
-    // Manifest Chrome/Edge (allowed_origins).
-    let chrome_manifest = dir.join("com.adm.bridge.json");
+    // Chrome/Edge/Chromium — allowed_origins.
     let chrome_json = format!(
         "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"Alpha Download Manager host\",\n  \"path\": \"{exe_str}\",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://{chrome_id}/\"]\n}}\n"
     );
-    std::fs::write(&chrome_manifest, chrome_json).expect("tulis manifest chrome");
-    reg_add("HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts", &chrome_manifest);
-    reg_add("HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts", &chrome_manifest);
-
-    // Manifest Firefox (allowed_extensions).
-    if let Some(fid) = firefox_id {
-        let ff_manifest = dir.join("com.adm.bridge.firefox.json");
-        let ff_json = format!(
-            "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"Alpha Download Manager host\",\n  \"path\": \"{exe_str}\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{fid}\"]\n}}\n"
-        );
-        std::fs::write(&ff_manifest, ff_json).expect("tulis manifest firefox");
-        reg_add("HKCU\\Software\\Mozilla\\NativeMessagingHosts", &ff_manifest);
+    for dir in chromium_dirs() {
+        write_manifest(&dir, &chrome_json);
     }
 
-    println!("[bridge] terdaftar. manifest: {}", chrome_manifest.display());
+    // Firefox — allowed_extensions.
+    if let Some(fid) = args.get(2) {
+        if let Some(dir) = firefox_dir() {
+            let ff_json = format!(
+                "{{\n  \"name\": \"{HOST_NAME}\",\n  \"description\": \"Alpha Download Manager host\",\n  \"path\": \"{exe_str}\",\n  \"type\": \"stdio\",\n  \"allowed_extensions\": [\"{fid}\"]\n}}\n"
+            );
+            write_manifest(&dir, &ff_json);
+        }
+    }
+    println!("[bridge] terdaftar (path host: {exe_str}).");
+}
+
+fn write_manifest(dir: &Path, json: &str) {
+    let file = dir.join(format!("{HOST_NAME}.json"));
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&file, json)) {
+        eprintln!("  ! gagal menulis {}: {e}", file.display());
+    } else {
+        println!("  + {}", file.display());
+    }
 }
 
 fn unregister() {
-    for base in [
-        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts",
-        "HKCU\\Software\\Microsoft\\Edge\\NativeMessagingHosts",
-        "HKCU\\Software\\Mozilla\\NativeMessagingHosts",
-    ] {
-        let key = format!("{base}\\{HOST_NAME}");
-        let _ = std::process::Command::new("reg")
-            .args(["delete", &key, "/f"])
-            .status();
+    let mut dirs = chromium_dirs();
+    dirs.extend(firefox_dir());
+    for dir in dirs {
+        let file = dir.join(format!("{HOST_NAME}.json"));
+        match std::fs::remove_file(&file) {
+            Ok(()) => println!("  - {}", file.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("  ! gagal menghapus {}: {e}", file.display()),
+        }
     }
-    println!("[bridge] registry host dihapus.");
-}
-
-fn reg_add(base: &str, manifest: &std::path::Path) {
-    let key = format!("{base}\\{HOST_NAME}");
-    let status = std::process::Command::new("reg")
-        .args([
-            "add",
-            &key,
-            "/ve",
-            "/t",
-            "REG_SZ",
-            "/d",
-            &manifest.to_string_lossy(),
-            "/f",
-        ])
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("  + {key}"),
-        _ => eprintln!("  ! gagal menulis {key}"),
-    }
+    println!("[bridge] manifest host dihapus.");
 }
