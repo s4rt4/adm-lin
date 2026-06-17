@@ -6,6 +6,7 @@ mod category;
 mod engine;
 mod ipc;
 mod store;
+mod tray;
 
 use category::Category;
 use eframe::egui;
@@ -14,7 +15,9 @@ use engine::{EngineEvent, EngineHandle};
 use ipc::IpcCommand;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 fn main() -> eframe::Result<()> {
@@ -179,6 +182,10 @@ struct AdmApp {
     // Dialog Refresh Link (id baris target + buffer URL baru).
     refresh_target: Option<u64>,
     refresh_url: String,
+    /// `true` bila tray SNI berhasil didaftarkan. Menentukan perilaku tombol
+    /// tutup jendela: ada tray → sembunyikan ke tray; tanpa tray (mis. GNOME
+    /// polos) → minimize ke dock agar jendela selalu bisa dipanggil kembali.
+    tray_active: Arc<AtomicBool>,
 }
 
 impl AdmApp {
@@ -209,6 +216,10 @@ impl AdmApp {
         let ipc_ctx = cc.egui_ctx.clone();
         let ipc_engine = engine.clone();
         rt.spawn(ipc::serve(ipc_tx, ipc_ctx, ipc_engine));
+
+        // Tray SNI (best-effort): dipakai bila lingkungan mendukungnya.
+        let tray_active = Arc::new(AtomicBool::new(false));
+        tray::launch(engine.clone(), cc.egui_ctx.clone(), tray_active.clone());
 
         // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
         let (rows, max_id) = store::load();
@@ -242,6 +253,22 @@ impl AdmApp {
             show_about: false,
             refresh_target: None,
             refresh_url: String::new(),
+            tray_active,
+        }
+    }
+
+    /// Tombol tutup jendela: jangan keluar — beradaptasi dgn lingkungan.
+    /// Ada tray → sembunyikan jendela (tetap jalan di tray). Tanpa tray (GNOME
+    /// polos) → minimize ke dock. Keluar betulan lewat menu Exit / tray Exit.
+    fn handle_close(&self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.tray_active.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     }
 
@@ -536,6 +563,7 @@ impl eframe::App for AdmApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_ipc(ui.ctx());
+        self.handle_close(ui.ctx());
 
         self.menu_bar(ui);
         self.toolbar(ui);
