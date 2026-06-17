@@ -1,0 +1,47 @@
+# Manifest Flatpak ADM. Build offline butuh `cargo-sources.json` yang
+# di-generate dari Cargo.lock dengan flatpak-builder-tools:
+#   python3 flatpak-cargo-generator.py Cargo.lock -o packaging/linux/cargo-sources.json
+# lalu:
+#   flatpak-builder --user --install build packaging/linux/io.github.s4rt4.adm.yml
+#
+# CATATAN:
+# - Native messaging (adm-bridge) TIDAK berfungsi penuh dalam sandbox flatpak:
+#   browser host di luar sandbox tak bisa menjangkau socket per-app. Untuk
+#   integrasi browser, pasang via RPM/install.sh (host), bukan flatpak.
+# - Tray (SNI): di lingkungan sandbox tertentu set disable_dbus_name(true).
+app-id: io.github.s4rt4.adm
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: adm-egui
+
+finish-args:
+  - --share=network                # unduhan
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri                   # GPU untuk egui
+  - --filesystem=xdg-download      # tulis ke ~/Downloads
+  - --socket=session-bus           # StatusNotifierItem (tray)
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/adm/cargo
+
+modules:
+  - name: adm
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release -p adm-egui
+      - install -Dm755 target/release/adm-egui /app/bin/adm-egui
+      - install -Dm644 packaging/linux/adm-egui.desktop
+        /app/share/applications/io.github.s4rt4.adm.desktop
+      - install -Dm644 crates/adm-egui/assets/logo.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.s4rt4.adm.svg
+    sources:
+      - type: dir
+        path: ../..
+      - cargo-sources.json

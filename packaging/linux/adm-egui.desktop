@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Alpha Download Manager
+GenericName=Download Manager
+Comment=Multi-connection download manager (IDM-style)
+Exec=adm-egui
+Icon=adm
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=download;manager;downloader;idm;
+StartupNotify=true
+StartupWMClass=adm-egui
