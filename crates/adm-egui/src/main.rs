@@ -4,18 +4,25 @@
 
 mod category;
 mod engine;
+mod ipc;
 mod store;
 
 use category::Category;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use engine::{EngineEvent, EngineHandle};
+use ipc::IpcCommand;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::SystemTime;
 
 fn main() -> eframe::Result<()> {
+    // Single-instance: bila sudah ada ADM yang berjalan, minta ia muncul lalu keluar.
+    if ipc::try_activate_existing() {
+        return Ok(());
+    }
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 720.0])
         .with_min_inner_size([860.0, 440.0])
@@ -139,6 +146,7 @@ struct AdmApp {
     _rt: tokio::runtime::Runtime,
     engine: EngineHandle,
     rx: mpsc::Receiver<EngineEvent>,
+    ipc_rx: mpsc::Receiver<IpcCommand>,
     download_dir: PathBuf,
     rows: Vec<Row>,
     index: HashMap<u64, usize>,
@@ -147,6 +155,9 @@ struct AdmApp {
     // Dialog "Add URL".
     show_add: bool,
     add_url: String,
+    /// Metadata titipan browser (referrer/UA/cookie) untuk add via IPC; dipakai
+    /// saat dialog Add dikonfirmasi agar header tak hilang.
+    pending_add: Option<adm_ipc::DownloadAddParams>,
 }
 
 impl AdmApp {
@@ -172,6 +183,12 @@ impl AdmApp {
         let download_dir = default_download_dir();
         let engine = EngineHandle::new(rt.handle().clone(), download_dir.clone(), sink);
 
+        // Server IPC bridge→app (native messaging + single-instance activate).
+        let (ipc_tx, ipc_rx) = mpsc::channel::<IpcCommand>();
+        let ipc_ctx = cc.egui_ctx.clone();
+        let ipc_engine = engine.clone();
+        rt.spawn(ipc::serve(ipc_tx, ipc_ctx, ipc_engine));
+
         // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
         let (rows, max_id) = store::load();
         if max_id > 0 {
@@ -187,6 +204,7 @@ impl AdmApp {
             _rt: rt,
             engine,
             rx,
+            ipc_rx,
             download_dir,
             rows,
             index,
@@ -194,7 +212,29 @@ impl AdmApp {
             selected: None,
             show_add: false,
             add_url: String::new(),
+            pending_add: None,
         }
+    }
+
+    /// Proses perintah dari jalur IPC (browser bridge / instance kedua).
+    fn drain_ipc(&mut self, ctx: &egui::Context) {
+        while let Ok(cmd) = self.ipc_rx.try_recv() {
+            match cmd {
+                IpcCommand::Add(params) => {
+                    self.add_url = params.url.clone();
+                    self.pending_add = Some(params);
+                    self.show_add = true;
+                    Self::bring_to_front(ctx);
+                }
+                IpcCommand::Activate => Self::bring_to_front(ctx),
+            }
+        }
+    }
+
+    /// Munculkan & fokuskan jendela (dipakai single-instance & klik bridge).
+    fn bring_to_front(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn drain_events(&mut self) {
@@ -308,10 +348,10 @@ impl AdmApp {
         if url.is_empty() {
             return;
         }
-        let params = adm_ipc::DownloadAddParams {
-            url,
-            ..Default::default()
-        };
+        // Pakai metadata titipan browser (referrer/UA/cookie) bila add via IPC;
+        // URL hasil edit di dialog tetap diutamakan.
+        let mut params = self.pending_add.take().unwrap_or_default();
+        params.url = url;
         if later {
             self.engine.enqueue(params);
         } else {
@@ -369,6 +409,7 @@ impl AdmApp {
 impl eframe::App for AdmApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.drain_ipc(ui.ctx());
 
         self.menu_bar(ui);
         self.toolbar(ui);
@@ -714,12 +755,14 @@ impl AdmApp {
                     if ui.button("Cancel").clicked() {
                         action = Some(false);
                         self.add_url.clear();
+                        self.pending_add = None;
                         self.show_add = false;
                     }
                 });
             });
         if !open {
             self.show_add = false;
+            self.pending_add = None;
         }
         if let Some(later) = action {
             if !self.add_url.trim().is_empty() {

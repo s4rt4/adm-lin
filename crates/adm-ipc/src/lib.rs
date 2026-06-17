@@ -6,8 +6,24 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Nama Named Pipe per-user (plan §16). WM2 akan menambah suffix SID + ACL.
+/// Nama Named Pipe per-user (plan §16, Windows). WM2 akan menambah suffix SID + ACL.
 pub const PIPE_NAME: &str = r"\\.\pipe\adm";
+
+/// Path Unix domain socket per-user (Linux/macOS). Default
+/// `$XDG_RUNTIME_DIR/adm.sock` (sudah per-user & dibersihkan otomatis saat
+/// logout); fallback `/tmp/adm-<uid>.sock` bila `XDG_RUNTIME_DIR` tak ada.
+#[cfg(unix)]
+pub fn unix_socket_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("adm.sock");
+        }
+    }
+    // Fallback (jarang — XDG_RUNTIME_DIR hampir selalu ada di sesi desktop):
+    // sertakan nama user agar tak bentrok antar-user di `/tmp`.
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
+    std::env::temp_dir().join(format!("adm-{user}.sock"))
+}
 
 /// Nama metode yang didukung jalur bridge<->app.
 pub mod method {
