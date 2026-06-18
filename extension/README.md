@@ -1,31 +1,46 @@
-# ADM Browser Integration (WM5)
+# ADM Browser Integration (Linux)
 
 Extension MV3 + native messaging host (`com.adm.bridge`). Lihat plan §11.
 
 ## Komponen
-- `extension/` — WebExtension MV3 (Chrome/Edge; Firefox perlu sedikit penyesuaian manifest).
-- `adm-bridge.exe` — native messaging host (stdio ↔ Named Pipe ke `adm-app`).
+- `extension/` — WebExtension MV3 (Chrome/Chromium/Edge; Firefox perlu sedikit penyesuaian).
+- `adm-bridge` — native messaging host (stdio ↔ Unix socket `$XDG_RUNTIME_DIR/adm.sock` ke `adm-egui`).
 
-## Cara pasang (development, Chrome/Edge)
+## ID ekstensi tetap
 
-1. **Build** workspace: `cargo build` (menghasilkan `adm-bridge.exe` & `adm-app.exe` di `target/debug`).
-2. **Muat extension**: buka `chrome://extensions` (atau `edge://extensions`) → aktifkan *Developer mode* → *Load unpacked* → pilih folder `extension/`.
-3. **Salin Extension ID** yang muncul (32 huruf).
-4. **Daftarkan host** (tulis manifest + registry `HKCU`):
+`manifest.json` memuat field `key` (kunci publik), sehingga **Extension ID selalu**
+`akdapmiioimlpcdapnkmonlgmkgjcobb` berapa kali pun dimuat ulang / di mesin mana pun.
+Karena itu host native-messaging bisa didaftarkan untuk ID tetap ini tanpa harus
+menyalin ID dari `chrome://extensions` tiap kali.
+
+Kunci privat untuk membuat ID tsb ada di `tools/adm-extension-key.pem` (di-`gitignore`,
+hanya diperlukan bila kelak ingin mem-pack `.crx`).
+
+## Cara pasang (development, Chrome/Chromium/Edge)
+
+1. **Build** workspace: `cargo build` → `adm-bridge` & `adm-egui` di `target/debug`.
+2. **Daftarkan host** (tulis manifest ke `~/.config/<browser>/NativeMessagingHosts/`):
    ```
-   target\debug\adm-bridge.exe register <EXTENSION_ID> [FIREFOX_ID]
+   target/debug/adm-bridge register akdapmiioimlpcdapnkmonlgmkgjcobb
    ```
-5. Selesai. Coba klik sebuah unduhan di browser, atau klik kanan link → **Download with ADM**.
-   - Bila `adm-app` belum jalan, bridge otomatis men-spawn-nya (`--tray`).
+   (Path host = lokasi biner `adm-bridge` saat perintah dijalankan.)
+3. **Muat extension**: buka `chrome://extensions` → aktifkan *Developer mode* →
+   *Load unpacked* → pilih folder `extension/`. ID-nya akan
+   `akdapmiioimlpcdapnkmonlgmkgjcobb`.
+4. Selesai. Uji:
+   - Klik kanan sebuah link → **Download with ADM**, atau
+   - Mulai unduhan apa pun → otomatis dibatalkan di browser & diserahkan ke ADM.
+   - Bila `adm-egui` belum jalan, bridge otomatis men-spawn-nya.
    - Toggle "tangkap unduhan otomatis" ada di popup ikon extension.
 
 ## Lepas
 ```
-target\debug\adm-bridge.exe unregister
+target/debug/adm-bridge unregister
 ```
 
 ## Catatan
-- Registry yang ditulis: `HKCU\Software\{Google\Chrome|Microsoft\Edge|Mozilla}\NativeMessagingHosts\com.adm.bridge` → path manifest.
-- Manifest Chrome/Edge memakai `allowed_origins` (chrome-extension://ID/); Firefox memakai `allowed_extensions`.
-- Di rilis, installer (WiX/Inno, §11.2) yang menulis registry + manifest; langkah `register` manual ini untuk development.
-- Extension ID unpacked bisa dibuat stabil dengan menambah field `key` di `manifest.json` (opsional).
+- Manifest host ditulis ke `~/.config/{google-chrome,chromium,microsoft-edge}/NativeMessagingHosts/com.adm.bridge.json`
+  (Chromium: `allowed_origins`), dan `~/.mozilla/native-messaging-hosts/` bila ID Firefox diberikan (`allowed_extensions`).
+- Pesan ke ADM: `{"method":"download.add","url":..,"filename":..,"referrer":..,"userAgent":..,"cookies":..}`.
+- Saat instalasi (RPM/Flatpak), path host harus menunjuk biner terpasang; jalankan ulang `register`
+  setelah memindah biner.

@@ -5,3 +5,7 @@ Cargo.lock.bak
 
 # Dokumen perencanaan internal — tidak ikut repo (lokal saja).
 ADM_Windows_Implementation_Plan.md
+
+# Kunci privat penandatangan ekstensi (dev) — hanya utk pack .crx; jangan commit.
+# ID ekstensi tetap berasal dari field "key" (publik) di extension/manifest.json.
+tools/adm-extension-key.pem

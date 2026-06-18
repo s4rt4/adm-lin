@@ -3,13 +3,29 @@
   "name": "Alpha Download Manager Integration",
   "version": "0.1.0",
   "description": "Tangkap unduhan browser dan kirim ke Alpha Download Manager (ADM).",
-  "permissions": ["downloads", "contextMenus", "storage", "nativeMessaging", "cookies", "webRequest"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js" },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiqhV+deDWI3HhFHv6Z44QF6H3jW2Qrnf6sEkomIKhzgmJKWAuza6d3sd9fvrHJD4RhBa2IoOaHZhIg5KBBKpV/FbcNUQdSFgYUPtQWVoowjYRoGhRZ4utN1H97ax2UmoFq/YDWBy+9y4OPo8bsl+tVHEQ7ITZlo2ktHgnVB2HmR9OcWEbyAVWMkB8fIxc8H8uvJ2O9R1WhNX8yOcG5MfIwg2OC/SQgqHGpIMmZg9gJLejldzbZZMo55tL8GLgmVFSR/v5AmhkMNhJtFJjvRDxq8uKK+muWkLCnAtBk7FpbV1sjU0hIXsLztTH3mC1w5B/TUUZo+1AbIi0w2009NcgQIDAQAB",
+  "permissions": [
+    "downloads",
+    "contextMenus",
+    "storage",
+    "nativeMessaging",
+    "cookies",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": false
     }
