@@ -112,6 +112,13 @@ enum RowAction {
     Move(Category),
 }
 
+/// Operasi berkas (Tasks ▸ Export/Import) yang menunggu hasil dialog file async.
+#[derive(Clone, Copy)]
+enum FileOp {
+    Export,
+    Import,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 enum Status {
     Queued,
@@ -225,6 +232,8 @@ struct AdmApp {
     // Dialog Scheduler (salinan kerja; disimpan ke scheduler.json saat OK).
     show_scheduler: bool,
     sched_edit: scheduler::Schedule,
+    /// Hasil dialog file Export/Import (async portal) yang menunggu diproses.
+    file_pick: Arc<Mutex<Option<(FileOp, PathBuf)>>>,
     /// `true` bila tray SNI berhasil didaftarkan. Menentukan perilaku tombol
     /// tutup jendela: ada tray → sembunyikan ke tray; tanpa tray (mis. GNOME
     /// polos) → minimize ke dock agar jendela selalu bisa dipanggil kembali.
@@ -323,6 +332,7 @@ impl AdmApp {
             find_scroll: None,
             show_scheduler: false,
             sched_edit: scheduler::get(),
+            file_pick: Arc::new(Mutex::new(None)),
             tray_active,
             dark: cfg.dark,
         }
@@ -781,12 +791,74 @@ impl AdmApp {
         self.sched_edit = scheduler::get();
         self.show_scheduler = true;
     }
+
+    // ---- Export / Import daftar URL ----
+
+    /// Pilih lokasi simpan (.txt) lewat portal file (dialog sync di thread
+    /// terpisah agar UI tak beku); hasilnya diproses di `drain_file_pick`.
+    fn export_urls(&self, ctx: &egui::Context) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let slot = self.file_pick.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Export URL list")
+                .set_file_name("adm-downloads.txt")
+                .add_filter("Text", &["txt"])
+                .save_file()
+            {
+                *slot.lock().unwrap() = Some((FileOp::Export, path));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Pilih berkas daftar URL untuk diimpor (dialog portal sync di thread lain).
+    fn import_urls(&self, ctx: &egui::Context) {
+        let slot = self.file_pick.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Import URL list")
+                .add_filter("Text", &["txt"])
+                .pick_file()
+            {
+                *slot.lock().unwrap() = Some((FileOp::Import, path));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Proses hasil dialog Export/Import yang sudah tiba dari portal.
+    fn drain_file_pick(&mut self) {
+        let pick = self.file_pick.lock().unwrap().take();
+        let Some((op, path)) = pick else { return };
+        match op {
+            FileOp::Export => {
+                let urls: Vec<String> = self.rows.iter().map(|r| r.url.clone()).collect();
+                let _ = std::fs::write(&path, urls.join("\n"));
+            }
+            FileOp::Import => {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    for url in tasks::parse_batch(&text) {
+                        self.engine.enqueue(adm_ipc::DownloadAddParams {
+                            url,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for AdmApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_ipc(ui.ctx());
+        self.drain_file_pick();
         self.handle_close(ui.ctx());
 
         // Pintasan: Ctrl+F = Find, F3 = Find Next.
@@ -838,8 +910,14 @@ impl AdmApp {
                         ui.close();
                     }
                     ui.separator();
-                    ui.add_enabled(false, egui::Button::new("Export..."));
-                    ui.add_enabled(false, egui::Button::new("Import..."));
+                    if ui.add_enabled(!self.rows.is_empty(), egui::Button::new("Export...")).clicked() {
+                        self.export_urls(ui.ctx());
+                        ui.close();
+                    }
+                    if ui.button("Import...").clicked() {
+                        self.import_urls(ui.ctx());
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("Exit\tCtrl+Q").clicked() {
                         std::process::exit(0);

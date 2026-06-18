@@ -22,6 +22,9 @@ serde_json = "1"
 ksni = { version = "0.3.5", default-features = false, features = ["async-io", "blocking"] }
 arboard = "3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# async-std (bukan tokio) agar zbus tetap pakai async-io — selaras dgn tray ksni
+# yang juga async-io (fitur tokio akan memaksa zbus global ke tokio → panic tray).
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 
 [dev-dependencies]
 tiny_http = "0.12"
