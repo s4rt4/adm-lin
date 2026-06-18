@@ -783,14 +783,26 @@ impl AdmApp {
                     self.open_refresh();
                 }
                 ui.separator();
-                if tbtn(ui, icon_start_queue(), "Start Queue", true) {
+                let (sq_clicked, sq_arrow) = tbtn_dd(ui, icon_start_queue(), "Start Queue", true);
+                if sq_clicked {
                     self.engine.start_queue();
                 }
-                if tbtn(ui, icon_stop_queue(), "Stop Queue", true) {
+                egui::Popup::menu(&sq_arrow).show(|ui| {
+                    ui.set_min_width(170.0);
+                    ui.weak("(belum ada antrian)");
+                });
+                let (tq_clicked, tq_arrow) = tbtn_dd(ui, icon_stop_queue(), "Stop Queue", true);
+                if tq_clicked {
                     self.engine.stop_queue();
                 }
+                egui::Popup::menu(&tq_arrow).show(|ui| {
+                    ui.set_min_width(170.0);
+                    ui.weak("(belum ada antrian)");
+                });
                 ui.separator();
-                tbtn(ui, icon_updates(), "Updates", false);
+                if tbtn(ui, icon_updates(), "Updates", true) {
+                    open_url("https://github.com/s4rt4/adm-lin");
+                }
             });
             ui.add_space(4.0);
         });
@@ -858,7 +870,12 @@ impl AdmApp {
 
             let mut clicked: Option<u64> = None;
             let mut action: Option<(u64, RowAction)> = None;
-            let mut row_rects: Vec<egui::Rect> = Vec::new();
+            // Area penuh tabel (dipakai menggambar grid horizontal termasuk baris kosong).
+            let body_area = {
+                let top = ui.cursor().min.y;
+                let full = ui.max_rect();
+                egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)
+            };
             TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
@@ -875,7 +892,9 @@ impl AdmApp {
                 .header(26.0, |mut h| {
                     for title in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Last Try", "Description"] {
                         h.col(|ui| {
-                            ui.strong(title);
+                            ui.centered_and_justified(|ui| {
+                                ui.strong(title);
+                            });
                         });
                     }
                 })
@@ -921,7 +940,6 @@ impl AdmApp {
                                 }
                             });
                             let resp = row.response();
-                            row_rects.push(resp.rect);
                             if resp.clicked() {
                                 clicked = Some(r.id);
                             }
@@ -978,7 +996,8 @@ impl AdmApp {
                     }
                 });
 
-            // Garis tipis pemisah antar-baris (gaya list IDM).
+            // Garis tipis pemisah antar-baris (gaya list IDM) — digambar merata
+            // di seluruh area tabel, termasuk baris kosong.
             let line_color = if ui.visuals().dark_mode {
                 egui::Color32::from_gray(58)
             } else {
@@ -986,8 +1005,12 @@ impl AdmApp {
             };
             let painter = ui.painter();
             let stroke = egui::Stroke::new(1.0, line_color);
-            for rect in &row_rects {
-                painter.hline(rect.x_range(), rect.bottom(), stroke);
+            const HEADER_H: f32 = 26.0;
+            const ROW_H: f32 = 26.0;
+            let mut y = body_area.top() + HEADER_H;
+            while y <= body_area.bottom() {
+                painter.hline(body_area.x_range(), y, stroke);
+                y += ROW_H;
             }
 
             if let Some(id) = clicked {
@@ -1242,6 +1265,87 @@ fn tbtn(ui: &mut egui::Ui, src: egui::ImageSource<'static>, label: &str, enabled
     enabled && resp.clicked()
 }
 
+/// Varian tombol toolbar dengan panah dropdown ▾ di sisi kanan (gaya tombol
+/// Start/Stop Queue versi Windows yang ber-flag BTNS_DROPDOWN). Mengembalikan
+/// `(tombol_utama_diklik, response_panah)`; pemanggil membuka popup daftar
+/// antrian via `egui::Popup::menu(&response_panah)`.
+fn tbtn_dd(
+    ui: &mut egui::Ui,
+    src: egui::ImageSource<'static>,
+    label: &str,
+    enabled: bool,
+) -> (bool, egui::Response) {
+    const ICON: f32 = 26.0;
+    const FONT: f32 = 13.0;
+    const PAD_X: f32 = 10.0;
+    const H: f32 = 62.0;
+    const ARROW_W: f32 = 18.0;
+
+    let font = egui::FontId::proportional(FONT);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+        .size()
+        .x;
+    let main_w = (text_w + PAD_X * 2.0).max(ICON + 12.0);
+
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(main_w + ARROW_W, H), egui::Sense::hover());
+    let main_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x - ARROW_W, rect.max.y));
+    let arrow_rect = egui::Rect::from_min_max(egui::pos2(rect.max.x - ARROW_W, rect.min.y), rect.max);
+
+    let main_resp = ui.interact(main_rect, ui.id().with((label, "qmain")), egui::Sense::click());
+    let arrow_resp = ui.interact(arrow_rect, ui.id().with((label, "qarrow")), egui::Sense::click());
+
+    let painter = ui.painter();
+    let visuals = ui.visuals();
+
+    if enabled {
+        for (r, resp) in [(main_rect, &main_resp), (arrow_rect, &arrow_resp)] {
+            if resp.is_pointer_button_down_on() {
+                painter.rect_filled(r, 4.0, visuals.widgets.active.bg_fill);
+            } else if resp.hovered() {
+                painter.rect_filled(r, 4.0, visuals.widgets.hovered.weak_bg_fill);
+            }
+        }
+    }
+
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(main_rect.center().x - ICON / 2.0, main_rect.top() + 6.0),
+        egui::vec2(ICON, ICON),
+    );
+    let base = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0xab, 0xb2, 0xbf)
+    } else {
+        egui::Color32::from_gray(43)
+    };
+    let tint = if enabled { base } else { base.gamma_multiply(0.38) };
+    egui::Image::new(src).tint(tint).paint_at(ui, icon_rect);
+
+    let text_color = if enabled {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    ui.painter().text(
+        egui::pos2(main_rect.center().x, icon_rect.bottom() + 4.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        font,
+        text_color,
+    );
+    // Panah dropdown ▾ digambar manual (font statik tak punya glyph U+25BE).
+    let c = arrow_rect.center();
+    let tri = vec![
+        egui::pos2(c.x - 4.0, c.y - 3.0),
+        egui::pos2(c.x + 4.0, c.y - 3.0),
+        egui::pos2(c.x, c.y + 3.0),
+    ];
+    ui.painter()
+        .add(egui::Shape::convex_polygon(tri, text_color, egui::Stroke::NONE));
+
+    (enabled && main_resp.clicked(), arrow_resp)
+}
+
 // Ikon Lucide (sama dengan versi Windows); di-embed saat kompilasi.
 fn icon_add_url() -> egui::ImageSource<'static> {
     egui::include_image!("../assets/icons/add-url.svg")
@@ -1418,6 +1522,11 @@ fn install_fonts(ctx: &egui::Context) {
 /// Buka berkas/folder dengan handler default desktop (`xdg-open`), terlepas.
 fn open_path(path: &std::path::Path) {
     let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Buka URL di browser default desktop (`xdg-open`), terlepas.
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }
 
 fn filename_of(p: &std::path::Path) -> String {
