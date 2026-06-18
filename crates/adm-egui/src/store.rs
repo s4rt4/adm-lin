@@ -61,6 +61,7 @@ impl PersistRow {
             status,
             error: None,
             last_try: self.last_try,
+            segments: Vec::new(),
         }
     }
 }
@@ -138,6 +139,7 @@ mod tests {
             status,
             error: Some("boom".into()), // transien
             last_try: SystemTime::UNIX_EPOCH,
+            segments: Vec::new(),
         }
     }
 

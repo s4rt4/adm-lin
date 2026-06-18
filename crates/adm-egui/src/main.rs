@@ -110,6 +110,8 @@ enum RowAction {
     Stop,
     Delete,
     Move(Category),
+    /// Buka dialog progress/status (gaya IDM) untuk baris ini.
+    Progress,
 }
 
 /// Operasi berkas (Tasks ▸ Export/Import) yang menunggu hasil dialog file async.
@@ -152,6 +154,8 @@ struct Row {
     status: Status,
     error: Option<String>,
     last_try: SystemTime,
+    /// Progres per koneksi `(start, end, downloaded)` — transien (dialog progress).
+    segments: Vec<(u64, u64, u64)>,
 }
 
 impl Row {
@@ -177,6 +181,15 @@ fn in_filter(r: &Row, f: Filter, grabber: &HashSet<u64>) -> bool {
     }
 }
 
+/// Status probe ukuran untuk dialog Add (diisi async oleh `probe_url`).
+#[derive(Clone, Copy, Default)]
+enum SizeState {
+    #[default]
+    Idle,
+    Probing,
+    Known(Option<u64>),
+}
+
 /// Status dialog Site Grabber, diisi oleh task async `grab_links`.
 #[derive(Default)]
 struct GrabState {
@@ -198,12 +211,21 @@ struct AdmApp {
     index: HashMap<u64, usize>,
     filter: Filter,
     selected: Option<u64>,
-    // Dialog "Add URL".
+    // Dialog "Add URL" / "Download File Info" (gaya IDM).
     show_add: bool,
     add_url: String,
+    add_category: Category,
+    add_filename: String,
+    add_size: Arc<Mutex<SizeState>>,
+    /// `true` bila dialog dibuka dari browser/bridge → judul "Download File Info".
+    add_info: bool,
     /// Metadata titipan browser (referrer/UA/cookie) untuk add via IPC; dipakai
     /// saat dialog Add dikonfirmasi agar header tak hilang.
     pending_add: Option<adm_ipc::DownloadAddParams>,
+    /// Kategori pilihan user di dialog Add (override deteksi otomatis), per id.
+    cat_override: HashMap<u64, Category>,
+    /// Id unduhan dengan dialog progress/status terbuka (gaya IDM, modeless).
+    progress_open: HashSet<u64>,
     // Dialog Options.
     show_options: bool,
     opt_dir: String,
@@ -312,7 +334,13 @@ impl AdmApp {
             selected: None,
             show_add: false,
             add_url: String::new(),
+            add_category: Category::General,
+            add_filename: String::new(),
+            add_size: Arc::new(Mutex::new(SizeState::Idle)),
+            add_info: false,
             pending_add: None,
+            cat_override: HashMap::new(),
+            progress_open: HashSet::new(),
             show_options: false,
             opt_dir,
             opt_queue_max: cfg.queue_max,
@@ -380,8 +408,9 @@ impl AdmApp {
             match cmd {
                 IpcCommand::Add(params) => {
                     self.add_url = params.url.clone();
+                    let fname = params.filename.clone().unwrap_or_default();
                     self.pending_add = Some(params);
-                    self.show_add = true;
+                    self.open_add(ctx, true, &fname);
                     Self::bring_to_front(ctx);
                 }
                 IpcCommand::Activate => Self::bring_to_front(ctx),
@@ -390,8 +419,11 @@ impl AdmApp {
     }
 
     /// Munculkan & fokuskan jendela (dipakai single-instance & klik bridge).
+    /// Penting: un-minimize dulu — bila jendela diminimalkan ke dock (mode tanpa
+    /// tray), `Visible/Focus` saja tak mengembalikannya ke tengah layar.
     fn bring_to_front(ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
@@ -421,13 +453,14 @@ impl AdmApp {
                     downloaded,
                     total,
                     speed_bps,
-                    ..
+                    segments,
                 } => {
                     if let Some(&i) = self.index.get(&id) {
                         let r = &mut self.rows[i];
                         r.downloaded = downloaded;
                         r.total = total;
                         r.speed_bps = speed_bps;
+                        r.segments = segments;
                         if r.status == Status::Queued {
                             r.status = Status::Active;
                         }
@@ -472,7 +505,12 @@ impl AdmApp {
 
     fn upsert(&mut self, id: u64, url: String, output: PathBuf, status: Status) {
         let filename = filename_of(&output);
-        let category = Category::from_filename(&filename);
+        // Hormati kategori pilihan user di dialog Add bila ada; else deteksi.
+        let category = self
+            .cat_override
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| Category::from_filename(&filename));
         if let Some(&i) = self.index.get(&id) {
             let r = &mut self.rows[i];
             r.url = url;
@@ -492,6 +530,7 @@ impl AdmApp {
                 status,
                 error: None,
                 last_try: SystemTime::now(),
+                segments: Vec::new(),
             });
         }
     }
@@ -507,16 +546,59 @@ impl AdmApp {
             return;
         }
         // Pakai metadata titipan browser (referrer/UA/cookie) bila add via IPC;
-        // URL hasil edit di dialog tetap diutamakan.
+        // URL & nama hasil edit di dialog tetap diutamakan.
         let mut params = self.pending_add.take().unwrap_or_default();
         params.url = url;
-        if later {
-            self.engine.enqueue(params);
+        let fname = self.add_filename.trim();
+        if !fname.is_empty() {
+            params.filename = Some(fname.to_string());
+        }
+        let id = if later {
+            self.engine.enqueue(params)
         } else {
-            self.engine.add(params);
+            self.engine.add(params)
+        };
+        // Kategori pilihan user (override deteksi otomatis di upsert).
+        self.cat_override.insert(id, self.add_category);
+        // Buka dialog progress/status (gaya IDM) untuk unduhan yang langsung jalan.
+        if !later {
+            self.progress_open.insert(id);
         }
         self.add_url.clear();
+        self.add_filename.clear();
         self.show_add = false;
+    }
+
+    /// Inisialisasi & buka dialog Add. `info` → judul "Download File Info"
+    /// (dipicu browser/bridge). `filename_hint` mengisi field Save As.
+    fn open_add(&mut self, ctx: &egui::Context, info: bool, filename_hint: &str) {
+        self.add_info = info;
+        self.add_filename = if !filename_hint.is_empty() {
+            filename_hint.to_string()
+        } else if !self.add_url.trim().is_empty() {
+            guess_filename(self.add_url.trim())
+        } else {
+            String::new()
+        };
+        self.add_category = Category::from_filename(&self.add_filename);
+        *self.add_size.lock().unwrap() = SizeState::Idle;
+        let url = self.add_url.trim().to_string();
+        if !url.is_empty() {
+            self.probe_add_size(ctx, url);
+        }
+        self.show_add = true;
+    }
+
+    /// Probe ukuran URL (async) untuk ditampilkan di dialog Add.
+    fn probe_add_size(&self, ctx: &egui::Context, url: String) {
+        *self.add_size.lock().unwrap() = SizeState::Probing;
+        let slot = self.add_size.clone();
+        let ctx = ctx.clone();
+        self.engine.runtime().spawn(async move {
+            let total = adm_core::probe_url(&url).await.ok().and_then(|p| p.total);
+            *slot.lock().unwrap() = SizeState::Known(total);
+            ctx.request_repaint();
+        });
     }
 
     fn resume_selected(&self) {
@@ -593,6 +675,9 @@ impl AdmApp {
                 self.delete_selected();
             }
             RowAction::Move(cat) => self.move_category(id, cat),
+            RowAction::Progress => {
+                self.progress_open.insert(id);
+            }
         }
     }
 
@@ -882,6 +967,7 @@ impl eframe::App for AdmApp {
         self.grabber_dialog(ui);
         self.find_dialog(ui);
         self.scheduler_dialog(ui);
+        self.progress_dialogs(ui);
     }
 }
 
@@ -894,7 +980,9 @@ impl AdmApp {
                 // ---- Tasks ----
                 ui.menu_button("Tasks", |ui| {
                     if ui.button("Add new download...\tCtrl+N").clicked() {
-                        self.show_add = true;
+                        self.add_url.clear();
+                        self.pending_add = None;
+                        self.open_add(ui.ctx(), false, "");
                         ui.close();
                     }
                     if ui.button("Add batch download...").clicked() {
@@ -1047,7 +1135,9 @@ impl AdmApp {
             ui.horizontal(|ui| {
                 // Urutan persis versi Windows (adm-app/gui.rs::add_toolbar_buttons).
                 if tbtn(ui, icon_add_url(), "Add URL", true) {
-                    self.show_add = true;
+                    self.add_url.clear();
+                    self.pending_add = None;
+                    self.open_add(ui.ctx(), false, "");
                 }
                 ui.separator();
                 if tbtn(ui, icon_resume(), "Resume", sel_resumable) {
@@ -1244,9 +1334,15 @@ impl AdmApp {
                             if resp.clicked() {
                                 clicked = Some(r.id);
                             }
-                            // Double-click membuka berkas (gaya IDM).
+                            // Double-click (gaya IDM): selesai → buka berkas;
+                            // masih berjalan/jeda → buka dialog progress/status.
                             if resp.double_clicked() {
-                                action = Some((r.id, RowAction::Open));
+                                let act = if r.status == Status::Completed {
+                                    RowAction::Open
+                                } else {
+                                    RowAction::Progress
+                                };
+                                action = Some((r.id, act));
                             }
                             let (id, status) = (r.id, r.status);
                             resp.context_menu(|ui| {
@@ -1329,21 +1425,68 @@ impl AdmApp {
         }
         let mut open = true;
         let mut action: Option<bool> = None; // Some(later)
-        egui::Window::new("Add download")
+        let mut reprobe = false;
+        // Judul mengikuti versi Windows (browser → "Download File Info").
+        let title = if self.add_info { "Download File Info" } else { "Add new download" };
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ui.ctx(), |ui| {
-                ui.set_min_width(420.0);
-                ui.label("Address (URL):");
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.add_url)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("https://…"),
-                );
-                resp.request_focus();
-                ui.add_space(8.0);
+                ui.set_min_width(480.0);
+                egui::Grid::new("add_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                    ui.label("URL:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.add_url)
+                            .desired_width(380.0)
+                            .hint_text("https://…"),
+                    );
+                    if !self.add_info {
+                        resp.request_focus();
+                    }
+                    // URL selesai diedit (fokus lepas) → probe ukuran & tebak nama.
+                    if resp.lost_focus() {
+                        reprobe = true;
+                    }
+                    ui.end_row();
+
+                    ui.label("Category:");
+                    egui::ComboBox::from_id_salt("add_cat")
+                        .selected_text(self.add_category.label())
+                        .show_ui(ui, |ui| {
+                            for cat in [
+                                Category::General,
+                                Category::Compressed,
+                                Category::Documents,
+                                Category::Music,
+                                Category::Programs,
+                                Category::Video,
+                            ] {
+                                ui.selectable_value(&mut self.add_category, cat, cat.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Save As:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.add_filename)
+                            .desired_width(380.0)
+                            .hint_text("nama berkas"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Size:");
+                    let size_txt = match *self.add_size.lock().unwrap() {
+                        SizeState::Idle => "—".to_string(),
+                        SizeState::Probing => "menghitung…".to_string(),
+                        SizeState::Known(Some(n)) => human_bytes(n),
+                        SizeState::Known(None) => "Tidak diketahui".to_string(),
+                    };
+                    ui.label(size_txt);
+                    ui.end_row();
+                });
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Start Download").clicked() {
                         action = Some(false);
@@ -1352,13 +1495,25 @@ impl AdmApp {
                         action = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
-                        action = Some(false);
                         self.add_url.clear();
+                        self.add_filename.clear();
                         self.pending_add = None;
                         self.show_add = false;
                     }
                 });
             });
+        if reprobe {
+            let url = self.add_url.trim().to_string();
+            if self.add_filename.trim().is_empty() && !url.is_empty() {
+                self.add_filename = guess_filename(&url);
+                self.add_category = Category::from_filename(&self.add_filename);
+            }
+            if url.is_empty() {
+                *self.add_size.lock().unwrap() = SizeState::Idle;
+            } else {
+                self.probe_add_size(ui.ctx(), url);
+            }
+        }
         if !open {
             self.show_add = false;
             self.pending_add = None;
@@ -1718,6 +1873,140 @@ impl AdmApp {
         }
         if !open {
             self.show_scheduler = false;
+        }
+    }
+
+    /// Dialog progress/status per-unduhan (gaya IDM): modeless, bisa banyak.
+    fn progress_dialogs(&mut self, ui: &mut egui::Ui) {
+        if self.progress_open.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = self.progress_open.iter().copied().collect();
+        let mut to_close = Vec::new();
+        let mut to_pause = Vec::new();
+        let mut to_resume = Vec::new();
+        let mut to_cancel = Vec::new();
+        let mut to_open = Vec::new();
+        for id in ids {
+            let Some(&i) = self.index.get(&id) else {
+                to_close.push(id);
+                continue;
+            };
+            let r = &self.rows[i];
+            let mut open = true;
+            egui::Window::new(format!("{}##progress-{}", r.filename, id))
+                .collapsible(true)
+                .resizable(true)
+                .default_width(520.0)
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(480.0);
+                    ui.strong(&r.filename);
+                    ui.weak(&r.url);
+                    ui.separator();
+                    egui::Grid::new(format!("pg-grid-{id}"))
+                        .num_columns(2)
+                        .spacing([12.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Status:");
+                            ui.label(status_text(r));
+                            ui.end_row();
+                            ui.label("Downloaded:");
+                            let tot = r.total.map(human_bytes).unwrap_or_else(|| "?".into());
+                            ui.label(format!("{} of {}", human_bytes(r.downloaded), tot));
+                            ui.end_row();
+                            ui.label("Transfer rate:");
+                            ui.label(if r.speed_bps > 0 {
+                                format!("{}/s", human_bytes(r.speed_bps))
+                            } else {
+                                "—".into()
+                            });
+                            ui.end_row();
+                            ui.label("Time left:");
+                            ui.label(time_left(r));
+                            ui.end_row();
+                            ui.label("Resume capability:");
+                            ui.label(if r.total.is_some() { "Yes" } else { "No" });
+                            ui.end_row();
+                        });
+                    ui.add_space(6.0);
+                    let frac = match r.total {
+                        Some(t) if t > 0 => (r.downloaded as f32 / t as f32).clamp(0.0, 1.0),
+                        _ => 0.0,
+                    };
+                    ui.add(egui::ProgressBar::new(frac).show_percentage());
+                    ui.add_space(8.0);
+                    if !r.segments.is_empty() {
+                        ui.label("Start positions and download progress by connections:");
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            egui::Grid::new(format!("seg-grid-{id}"))
+                                .num_columns(3)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.strong("N.");
+                                    ui.strong("Downloaded");
+                                    ui.strong("Range");
+                                    ui.end_row();
+                                    for (n, (start, end, dl)) in r.segments.iter().enumerate() {
+                                        ui.label(format!("{}", n + 1));
+                                        ui.label(human_bytes(*dl));
+                                        ui.label(format!("{} – {}", human_bytes(*start), human_bytes(*end)));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                        ui.add_space(8.0);
+                    }
+                    ui.horizontal(|ui| {
+                        match r.status {
+                            Status::Active => {
+                                if ui.button("Pause").clicked() {
+                                    to_pause.push(id);
+                                }
+                            }
+                            Status::Paused | Status::Failed => {
+                                if ui.button("Resume").clicked() {
+                                    to_resume.push(id);
+                                }
+                            }
+                            _ => {}
+                        }
+                        if r.status == Status::Completed {
+                            if ui.button("Open").clicked() {
+                                to_open.push(id);
+                            }
+                        } else if ui.button("Cancel").clicked() {
+                            to_cancel.push(id);
+                        }
+                        if ui.button("Close").clicked() {
+                            to_close.push(id);
+                        }
+                    });
+                });
+            if !open {
+                to_close.push(id);
+            }
+        }
+        for id in to_pause {
+            self.engine.cancel(id); // stop, simpan parsial → jadi Paused
+        }
+        for id in to_resume {
+            if let Some(&i) = self.index.get(&id) {
+                let (url, fname) = (self.rows[i].url.clone(), self.rows[i].filename.clone());
+                self.engine.resume(id, url, fname, false);
+            }
+        }
+        for id in to_cancel {
+            self.engine.cancel(id);
+            self.progress_open.remove(&id);
+        }
+        for id in to_open {
+            if let Some(&i) = self.index.get(&id) {
+                open_path(&self.row_path(&self.rows[i]));
+            }
+        }
+        for id in to_close {
+            self.progress_open.remove(&id);
         }
     }
 }
@@ -2085,6 +2374,16 @@ fn filename_of(p: &std::path::Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "(no name)".into())
+}
+
+/// Tebak nama berkas dari URL (segmen path terakhir, tanpa query/fragment).
+fn guess_filename(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download.bin")
+        .to_string()
 }
 
 fn human_bytes(n: u64) -> String {
