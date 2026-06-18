@@ -25,15 +25,33 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 fn main() -> eframe::Result<()> {
-    // Single-instance: bila sudah ada ADM yang berjalan, minta ia muncul lalu keluar.
+    // Single-instance, dua lapis:
+    // 1. Jalur cepat: bila ada ADM yang sudah hidup & membalas, aktifkan ia, keluar.
     if ipc::try_activate_existing() {
         return Ok(());
     }
+    // 2. Pemilihan primary atomik via flock. Tanpa ini, beberapa proses yang
+    //    lahir nyaris bersamaan (browser men-spawn satu app per pesan bridge)
+    //    sama-sama lolos jalur (1) lalu membuka banyak jendela utama.
+    //    Pemegang kunci = primary; `_primary` ditahan selama proses hidup.
+    let _primary = match ipc::acquire_primary() {
+        Some(lock) => lock,
+        None => {
+            // Primary lain sedang start — aktifkan ia (retry hingga socket siap)
+            // lalu keluar tanpa membuka jendela.
+            ipc::activate_with_retry();
+            return Ok(());
+        }
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1180.0, 720.0])
         .with_min_inner_size([860.0, 440.0])
-        .with_title("Alpha Download Manager");
+        .with_title("Alpha Download Manager")
+        // app_id = WM_CLASS (X11) / app_id (Wayland). Dock GNOME mencocokkan ini
+        // ke `adm-egui.desktop` (StartupWMClass=adm-egui) untuk ambil ikonnya;
+        // tanpa ini dock memakai ikon generik.
+        .with_app_id("adm-egui");
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -181,6 +199,76 @@ fn in_filter(r: &Row, f: Filter, grabber: &HashSet<u64>) -> bool {
     }
 }
 
+/// Aksi "Options on completion" (tab ke-3 dialog progress, gaya IDM).
+#[derive(Clone, Copy, PartialEq)]
+enum WhenDone {
+    ShutDown,
+    Hibernate,
+    Sleep,
+    Exit,
+}
+
+impl WhenDone {
+    fn label(self) -> &'static str {
+        match self {
+            WhenDone::ShutDown => "Shut down",
+            WhenDone::Hibernate => "Hibernate",
+            WhenDone::Sleep => "Sleep",
+            WhenDone::Exit => "Exit",
+        }
+    }
+}
+
+/// Setelan "Options on completion" (tab ke-3). Dipersist per-id di `AdmApp`
+/// agar tetap dieksekusi saat unduhan selesai walau dialog sudah ditutup.
+#[derive(Clone, Copy)]
+struct CompletionOpts {
+    /// Tampilkan dialog "Download complete" saat selesai.
+    show_complete: bool,
+    /// Keluar dari ADM saat unduhan ini selesai.
+    exit_done: bool,
+    /// Jalankan aksi daya (`when_done`) saat selesai.
+    poweroff_done: bool,
+    when_done: WhenDone,
+}
+
+impl Default for CompletionOpts {
+    fn default() -> Self {
+        Self {
+            show_complete: true, // gaya IDM: dialog complete tampil secara default
+            exit_done: false,
+            poweroff_done: false,
+            when_done: WhenDone::ShutDown,
+        }
+    }
+}
+
+/// State per-dialog progress (gaya IDM, 3 tab). Disimpan per-id agar pilihan tab,
+/// detail tampil, dan setelan Speed Limiter / Options bertahan antar-frame.
+struct ProgressUi {
+    /// Tab aktif: 0=Download status, 1=Speed Limiter, 2=Options on completion.
+    tab: usize,
+    /// Area detail (segment bar + tabel koneksi) tampil — tombol Hide/Show details.
+    details: bool,
+    // Tab Speed Limiter.
+    limit_on: bool,
+    limit_kbps: u64,
+    // Tab Options on completion.
+    completion: CompletionOpts,
+}
+
+impl Default for ProgressUi {
+    fn default() -> Self {
+        Self {
+            tab: 0,
+            details: true,
+            limit_on: false,
+            limit_kbps: 0,
+            completion: CompletionOpts::default(),
+        }
+    }
+}
+
 /// Status probe ukuran untuk dialog Add (diisi async oleh `probe_url`).
 #[derive(Clone, Copy, Default)]
 enum SizeState {
@@ -224,8 +312,17 @@ struct AdmApp {
     pending_add: Option<adm_ipc::DownloadAddParams>,
     /// Kategori pilihan user di dialog Add (override deteksi otomatis), per id.
     cat_override: HashMap<u64, Category>,
-    /// Id unduhan dengan dialog progress/status terbuka (gaya IDM, modeless).
-    progress_open: HashSet<u64>,
+    /// Dialog progress/status terbuka (gaya IDM, modeless): id → state UI dialog.
+    progress_open: HashMap<u64, ProgressUi>,
+    /// Setelan "Options on completion" per-id (persist walau dialog ditutup),
+    /// dibaca saat unduhan selesai.
+    completion: HashMap<u64, CompletionOpts>,
+    /// Id dengan dialog "Download complete" terbuka (modeless).
+    complete_open: HashSet<u64>,
+    /// Permintaan tertunda dari "Options on completion" (dieksekusi setelah
+    /// daftar dipersist, di akhir `drain_events`).
+    pending_exit: bool,
+    pending_power: Option<WhenDone>,
     // Dialog Options.
     show_options: bool,
     opt_dir: String,
@@ -340,7 +437,11 @@ impl AdmApp {
             add_info: false,
             pending_add: None,
             cat_override: HashMap::new(),
-            progress_open: HashSet::new(),
+            progress_open: HashMap::new(),
+            completion: HashMap::new(),
+            complete_open: HashSet::new(),
+            pending_exit: false,
+            pending_power: None,
             show_options: false,
             opt_dir,
             opt_queue_max: cfg.queue_max,
@@ -387,19 +488,22 @@ impl AdmApp {
         self.save_settings();
     }
 
-    /// Tombol tutup jendela: jangan keluar — beradaptasi dgn lingkungan.
-    /// Ada tray → sembunyikan jendela (tetap jalan di tray). Tanpa tray (GNOME
-    /// polos) → minimize ke dock. Keluar betulan lewat menu Exit / tray Exit.
+    /// Tombol tutup jendela: beradaptasi dgn lingkungan.
+    /// Ada tray → batalkan close & sembunyikan jendela (tetap jalan di tray;
+    /// keluar betulan lewat menu Exit / tray Exit).
+    /// Tanpa tray (GNOME polos) → JANGAN batalkan close: biarkan app keluar.
+    /// Kalau di-intercept, "Quit" dari klik-kanan dock (yang bekerja dgn menutup
+    /// semua window) tak akan mematikan app — dan tanpa tray tak ada cara lain
+    /// memunculkannya kembali selain dock. Jadi close = exit, seperti app lain.
     fn handle_close(&self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if self.tray_active.load(Ordering::SeqCst) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
+        // Tanpa tray: tidak ada CancelClose → eframe menutup & proses keluar.
     }
 
     /// Proses perintah dari jalur IPC (browser bridge / instance kedua).
@@ -477,6 +581,19 @@ impl AdmApp {
                         r.status = Status::Completed;
                         dirty = true;
                     }
+                    // "Options on completion": tampilkan dialog complete / antrekan
+                    // exit / aksi daya (dieksekusi setelah persist di bawah).
+                    if let Some(opts) = self.completion.get(&id).copied() {
+                        if opts.show_complete {
+                            self.complete_open.insert(id);
+                        }
+                        if opts.exit_done {
+                            self.pending_exit = true;
+                        }
+                        if opts.poweroff_done {
+                            self.pending_power = Some(opts.when_done);
+                        }
+                    }
                 }
                 EngineEvent::Paused { id, downloaded } => {
                     if let Some(&i) = self.index.get(&id) {
@@ -500,6 +617,14 @@ impl AdmApp {
         }
         if dirty {
             store::save(&self.rows);
+        }
+        // Eksekusi aksi penyelesaian setelah daftar dipersist. Aksi daya dijalankan
+        // lebih dulu (lalu app keluar); exit murni bila tak ada aksi daya.
+        if let Some(w) = self.pending_power.take() {
+            perform_power(w);
+        }
+        if self.pending_exit {
+            std::process::exit(0);
         }
     }
 
@@ -562,7 +687,7 @@ impl AdmApp {
         self.cat_override.insert(id, self.add_category);
         // Buka dialog progress/status (gaya IDM) untuk unduhan yang langsung jalan.
         if !later {
-            self.progress_open.insert(id);
+            self.progress_open.entry(id).or_default();
         }
         self.add_url.clear();
         self.add_filename.clear();
@@ -601,11 +726,16 @@ impl AdmApp {
         });
     }
 
-    fn resume_selected(&self) {
-        if let Some(r) = self.selected_row() {
-            self.engine
-                .resume(r.id, r.url.clone(), r.filename.clone(), false);
-        }
+    fn resume_selected(&mut self) {
+        let Some((id, url, filename)) = self
+            .selected_row()
+            .map(|r| (r.id, r.url.clone(), r.filename.clone()))
+        else {
+            return;
+        };
+        self.engine.resume(id, url, filename, false);
+        // Gaya IDM: lanjutkan unduhan & buka kembali dialog progress/status.
+        self.progress_open.entry(id).or_default();
     }
 
     fn stop_selected(&self) {
@@ -641,6 +771,11 @@ impl AdmApp {
             for (i, r) in self.rows.iter().enumerate() {
                 self.index.insert(r.id, i);
             }
+            // Bersihkan state terkait id agar tak ada sisa basi (mis. aksi
+            // penyelesaian yang tak akan pernah dipicu).
+            self.progress_open.remove(&id);
+            self.complete_open.remove(&id);
+            self.completion.remove(&id);
             store::save(&self.rows);
         }
     }
@@ -676,7 +811,7 @@ impl AdmApp {
             }
             RowAction::Move(cat) => self.move_category(id, cat),
             RowAction::Progress => {
-                self.progress_open.insert(id);
+                self.progress_open.entry(id).or_default();
             }
         }
     }
@@ -968,6 +1103,7 @@ impl eframe::App for AdmApp {
         self.find_dialog(ui);
         self.scheduler_dialog(ui);
         self.progress_dialogs(ui);
+        self.complete_dialogs(ui);
     }
 }
 
@@ -1249,6 +1385,11 @@ impl AdmApp {
 
     fn table(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
+            // Rapatkan baris: tanpa ini, item_spacing vertikal global (7px) jadi
+            // celah antar-baris yang ikut tertutup highlight seleksi (tampak
+            // "tumpah" ke baris bawah) & membuat garis grid 26px meleset dari
+            // baris asli (26+7px). 0 → pitch baris = 26px, selaras dgn grid.
+            ui.spacing_mut().item_spacing.y = 0.0;
             let filter = self.filter;
             let visible: Vec<usize> = (0..self.rows.len())
                 .filter(|&i| in_filter(&self.rows[i], filter, &self.grabber_ids))
@@ -1877,113 +2018,113 @@ impl AdmApp {
     }
 
     /// Dialog progress/status per-unduhan (gaya IDM): modeless, bisa banyak.
+    /// Dialog progress/status gaya IDM (3 tab + segment bar + Hide details).
     fn progress_dialogs(&mut self, ui: &mut egui::Ui) {
         if self.progress_open.is_empty() {
             return;
         }
-        let ids: Vec<u64> = self.progress_open.iter().copied().collect();
+        let ids: Vec<u64> = self.progress_open.keys().copied().collect();
         let mut to_close = Vec::new();
         let mut to_pause = Vec::new();
         let mut to_resume = Vec::new();
         let mut to_cancel = Vec::new();
         let mut to_open = Vec::new();
+        let mut to_limit: Vec<(u64, u64)> = Vec::new();
         for id in ids {
             let Some(&i) = self.index.get(&id) else {
                 to_close.push(id);
                 continue;
             };
+            // Keluarkan state dialog (owned) agar bisa di-mutate sembari meminjam
+            // `self.rows` immutable; dikembalikan setelah render bila masih dibuka.
+            let mut st = self.progress_open.remove(&id).unwrap_or_default();
             let r = &self.rows[i];
+
+            let pct = match r.total {
+                Some(t) if t > 0 => ((r.downloaded as f64 / t as f64) * 100.0) as u32,
+                _ => 0,
+            };
+            // Judul gaya IDM: "41%  namafile". Id window dipisah (stabil) agar
+            // posisi/ukuran tak ter-reset tiap persentase berubah.
+            let title = if r.total.is_some() {
+                format!("{pct}%  {}", r.filename)
+            } else {
+                r.filename.clone()
+            };
+
             let mut open = true;
-            egui::Window::new(format!("{}##progress-{}", r.filename, id))
+            egui::Window::new(title)
+                .id(egui::Id::new(("progress", id)))
                 .collapsible(true)
                 .resizable(true)
-                .default_width(520.0)
+                .default_width(540.0)
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
-                    ui.set_min_width(480.0);
-                    ui.strong(&r.filename);
-                    ui.weak(&r.url);
-                    ui.separator();
-                    egui::Grid::new(format!("pg-grid-{id}"))
-                        .num_columns(2)
-                        .spacing([12.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Status:");
-                            ui.label(status_text(r));
-                            ui.end_row();
-                            ui.label("Downloaded:");
-                            let tot = r.total.map(human_bytes).unwrap_or_else(|| "?".into());
-                            ui.label(format!("{} of {}", human_bytes(r.downloaded), tot));
-                            ui.end_row();
-                            ui.label("Transfer rate:");
-                            ui.label(if r.speed_bps > 0 {
-                                format!("{}/s", human_bytes(r.speed_bps))
-                            } else {
-                                "—".into()
-                            });
-                            ui.end_row();
-                            ui.label("Time left:");
-                            ui.label(time_left(r));
-                            ui.end_row();
-                            ui.label("Resume capability:");
-                            ui.label(if r.total.is_some() { "Yes" } else { "No" });
-                            ui.end_row();
-                        });
-                    ui.add_space(6.0);
-                    let frac = match r.total {
-                        Some(t) if t > 0 => (r.downloaded as f32 / t as f32).clamp(0.0, 1.0),
-                        _ => 0.0,
-                    };
-                    ui.add(egui::ProgressBar::new(frac).show_percentage());
-                    ui.add_space(8.0);
-                    if !r.segments.is_empty() {
-                        ui.label("Start positions and download progress by connections:");
-                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                            egui::Grid::new(format!("seg-grid-{id}"))
-                                .num_columns(3)
-                                .striped(true)
-                                .show(ui, |ui| {
-                                    ui.strong("N.");
-                                    ui.strong("Downloaded");
-                                    ui.strong("Range");
-                                    ui.end_row();
-                                    for (n, (start, end, dl)) in r.segments.iter().enumerate() {
-                                        ui.label(format!("{}", n + 1));
-                                        ui.label(human_bytes(*dl));
-                                        ui.label(format!("{} – {}", human_bytes(*start), human_bytes(*end)));
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                        ui.add_space(8.0);
-                    }
+                    ui.set_min_width(500.0);
+
+                    // ---- Bar tab (emulasi SysTabControl versi Windows) ----
                     ui.horizontal(|ui| {
-                        match r.status {
-                            Status::Active => {
-                                if ui.button("Pause").clicked() {
-                                    to_pause.push(id);
+                        ui.selectable_value(&mut st.tab, 0usize, "Download status");
+                        ui.selectable_value(&mut st.tab, 1usize, "Speed Limiter");
+                        ui.selectable_value(&mut st.tab, 2usize, "Options on completion");
+                    });
+                    ui.separator();
+
+                    match st.tab {
+                        0 => Self::pg_tab_status(ui, id, r, st.details),
+                        1 => {
+                            if Self::pg_tab_limiter(ui, &mut st) {
+                                let bps = if st.limit_on { st.limit_kbps * 1024 } else { 0 };
+                                to_limit.push((id, bps));
+                            }
+                        }
+                        _ => Self::pg_tab_options(ui, id, &mut st),
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    // ---- Tombol bawah (semua tab): Hide details | Resume/Pause Cancel Close ----
+                    ui.horizontal(|ui| {
+                        let det_label = if st.details { "<< Hide details" } else { "Show details >>" };
+                        if ui
+                            .add_enabled(st.tab == 0, egui::Button::new(det_label))
+                            .clicked()
+                        {
+                            st.details = !st.details;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Close").clicked() {
+                                to_close.push(id);
+                            }
+                            if r.status == Status::Completed {
+                                if ui.button("Open").clicked() {
+                                    to_open.push(id);
                                 }
+                            } else if ui.button("Cancel").clicked() {
+                                to_cancel.push(id);
                             }
-                            Status::Paused | Status::Failed => {
-                                if ui.button("Resume").clicked() {
-                                    to_resume.push(id);
+                            match r.status {
+                                Status::Active => {
+                                    if ui.button("Pause").clicked() {
+                                        to_pause.push(id);
+                                    }
                                 }
+                                Status::Paused | Status::Failed => {
+                                    if ui.button("Resume").clicked() {
+                                        to_resume.push(id);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        }
-                        if r.status == Status::Completed {
-                            if ui.button("Open").clicked() {
-                                to_open.push(id);
-                            }
-                        } else if ui.button("Cancel").clicked() {
-                            to_cancel.push(id);
-                        }
-                        if ui.button("Close").clicked() {
-                            to_close.push(id);
-                        }
+                        });
                     });
                 });
-            if !open {
+            // Persist setelan "Options on completion" (tetap berlaku walau dialog
+            // ditutup, dieksekusi saat unduhan selesai).
+            self.completion.insert(id, st.completion);
+            if open {
+                self.progress_open.insert(id, st); // kembalikan state dialog
+            } else {
                 to_close.push(id);
             }
         }
@@ -1996,6 +2137,9 @@ impl AdmApp {
                 self.engine.resume(id, url, fname, false);
             }
         }
+        for (id, bps) in to_limit {
+            self.engine.set_limit(id, bps);
+        }
         for id in to_cancel {
             self.engine.cancel(id);
             self.progress_open.remove(&id);
@@ -2007,6 +2151,202 @@ impl AdmApp {
         }
         for id in to_close {
             self.progress_open.remove(&id);
+        }
+    }
+
+    /// Tab 1: "Download status" — info + progress bar + (detail) segment bar &
+    /// tabel koneksi (N. / Downloaded / Info), mirror versi Windows.
+    fn pg_tab_status(ui: &mut egui::Ui, id: u64, r: &Row, details: bool) {
+        ui.add_space(4.0);
+        ui.strong(&r.filename);
+        ui.weak(&r.url);
+        ui.add_space(6.0);
+        egui::Grid::new(format!("pg-grid-{id}"))
+            .num_columns(2)
+            .spacing([16.0, 7.0])
+            .show(ui, |ui| {
+                ui.label("Status:");
+                ui.label(status_line_idm(r));
+                ui.end_row();
+                ui.label("File size:");
+                ui.label(r.total.map(human_bytes).unwrap_or_else(|| "?".into()));
+                ui.end_row();
+                ui.label("Downloaded:");
+                let pct = match r.total {
+                    Some(t) if t > 0 => (r.downloaded as f64 / t as f64 * 100.0) as u32,
+                    _ => 0,
+                };
+                ui.label(format!("{} ({pct}%)", human_bytes(r.downloaded)));
+                ui.end_row();
+                ui.label("Transfer rate:");
+                ui.label(if r.speed_bps > 0 {
+                    format!("{}/s", human_bytes(r.speed_bps))
+                } else {
+                    "—".into()
+                });
+                ui.end_row();
+                ui.label("Time left:");
+                ui.label(time_left(r));
+                ui.end_row();
+                ui.label("Resume capability:");
+                ui.label(if r.total.is_some() { "Yes" } else { "No" });
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        let frac = match r.total {
+            Some(t) if t > 0 => (r.downloaded as f32 / t as f32).clamp(0.0, 1.0),
+            _ => 0.0,
+        };
+        ui.add(egui::ProgressBar::new(frac).show_percentage());
+
+        if details {
+            ui.add_space(10.0);
+            ui.label("Start positions and download progress by connections:");
+            ui.add_space(4.0);
+            segment_bar(ui, &r.segments, r.total);
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(150.0)
+                .show(ui, |ui| {
+                    egui::Grid::new(format!("seg-grid-{id}"))
+                        .num_columns(3)
+                        .striped(true)
+                        .min_col_width(60.0)
+                        .show(ui, |ui| {
+                            ui.strong("N.");
+                            ui.strong("Downloaded");
+                            ui.strong("Info");
+                            ui.end_row();
+                            if r.segments.is_empty() {
+                                ui.label("1");
+                                ui.label(human_bytes(r.downloaded));
+                                ui.label(conn_info(r.status, r.downloaded, r.total.unwrap_or(0)));
+                                ui.end_row();
+                            } else {
+                                for (n, (start, end, dl)) in r.segments.iter().enumerate() {
+                                    let len = end - start + 1;
+                                    ui.label(format!("{}", n + 1));
+                                    ui.label(human_bytes(*dl));
+                                    ui.label(conn_info(r.status, *dl, len));
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                });
+        }
+    }
+
+    /// Tab 2: "Speed Limiter" — batas kecepatan per-unduhan (live via engine).
+    /// Mengembalikan `true` bila setelan berubah (pemanggil terapkan ke engine).
+    fn pg_tab_limiter(ui: &mut egui::Ui, st: &mut ProgressUi) -> bool {
+        let mut changed = false;
+        ui.add_space(6.0);
+        ui.label("Use the speed limiter to reduce bandwidth usage for this download.");
+        ui.add_space(10.0);
+        changed |= ui.checkbox(&mut st.limit_on, "Use Speed Limiter").changed();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Maximum download speed:");
+            let resp = ui.add_enabled(
+                st.limit_on,
+                egui::DragValue::new(&mut st.limit_kbps)
+                    .speed(10.0)
+                    .range(0..=10_000_000u64),
+            );
+            changed |= resp.changed();
+            ui.label("KB/s");
+        });
+        ui.add_space(18.0);
+        changed
+    }
+
+    /// Tab 3: "Options on completion" — dieksekusi saat unduhan selesai
+    /// (dialog complete / exit ADM / aksi daya). Lihat `apply_completion`.
+    fn pg_tab_options(ui: &mut egui::Ui, id: u64, st: &mut ProgressUi) {
+        let c = &mut st.completion;
+        ui.add_space(6.0);
+        ui.checkbox(&mut c.show_complete, "Show download complete dialog");
+        ui.checkbox(&mut c.exit_done, "Exit ADM when done");
+        ui.checkbox(&mut c.poweroff_done, "Run action when done");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("When done:");
+            egui::ComboBox::from_id_salt(("when-done", id))
+                .selected_text(c.when_done.label())
+                .show_ui(ui, |ui| {
+                    for w in [WhenDone::ShutDown, WhenDone::Hibernate, WhenDone::Sleep, WhenDone::Exit] {
+                        ui.selectable_value(&mut c.when_done, w, w.label());
+                    }
+                });
+        });
+    }
+
+    /// Dialog modeless "Download complete" (gaya IDM §9.14): Open / Open folder /
+    /// Close. Dipicu opsi "Show download complete dialog" saat unduhan selesai.
+    fn complete_dialogs(&mut self, ui: &mut egui::Ui) {
+        if self.complete_open.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = self.complete_open.iter().copied().collect();
+        let mut to_close = Vec::new();
+        let mut to_open = Vec::new();
+        let mut to_folder = Vec::new();
+        for id in ids {
+            let Some(&i) = self.index.get(&id) else {
+                to_close.push(id);
+                continue;
+            };
+            let path = self.row_path(&self.rows[i]);
+            let r = &self.rows[i];
+            let mut open = true;
+            egui::Window::new(format!("Download complete##cmpl-{id}"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .open(&mut open)
+                .show(ui.ctx(), |ui| {
+                    ui.set_min_width(420.0);
+                    ui.add_space(4.0);
+                    ui.strong("Download complete");
+                    ui.add_space(8.0);
+                    ui.label(&r.filename);
+                    let sz = r.total.map(human_bytes).unwrap_or_else(|| human_bytes(r.downloaded));
+                    ui.weak(format!("Downloaded {sz}"));
+                    ui.add_space(6.0);
+                    ui.weak(path.display().to_string());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Open").clicked() {
+                            to_open.push(id);
+                        }
+                        if ui.button("Open folder").clicked() {
+                            to_folder.push(id);
+                        }
+                        if ui.button("Close").clicked() {
+                            to_close.push(id);
+                        }
+                    });
+                });
+            if !open {
+                to_close.push(id);
+            }
+        }
+        for id in to_open {
+            if let Some(&i) = self.index.get(&id) {
+                open_path(&self.row_path(&self.rows[i]));
+            }
+            self.complete_open.remove(&id);
+        }
+        for id in to_folder {
+            if let Some(&i) = self.index.get(&id) {
+                if let Some(p) = self.row_path(&self.rows[i]).parent() {
+                    open_path(p);
+                }
+            }
+            self.complete_open.remove(&id);
+        }
+        for id in to_close {
+            self.complete_open.remove(&id);
         }
     }
 }
@@ -2235,6 +2575,73 @@ fn status_text(r: &Row) -> String {
     }
 }
 
+/// Teks status gaya IDM untuk dialog progress ("Receiving data..." dst).
+fn status_line_idm(r: &Row) -> String {
+    match r.status {
+        Status::Active => "Receiving data...".into(),
+        Status::Queued => "Queued".into(),
+        Status::Completed => "Complete".into(),
+        Status::Paused => "Stopped".into(),
+        Status::Failed => r.error.clone().unwrap_or_else(|| "Error".into()),
+    }
+}
+
+/// Teks kolom "Info" per-koneksi (tabel dialog progress, gaya IDM).
+fn conn_info(status: Status, dl: u64, len: u64) -> String {
+    if len > 0 && dl >= len {
+        return "Finished".into();
+    }
+    match status {
+        Status::Active => "Receiving data...".into(),
+        Status::Paused => "Stopped".into(),
+        Status::Failed => "Error".into(),
+        Status::Queued => "Waiting".into(),
+        Status::Completed => "Finished".into(),
+    }
+}
+
+/// Segment bar (gaya IDM): porsi terunduh tiap koneksi (biru) di atas rentang
+/// byte-nya pada keseluruhan berkas; sisa rentang abu-abu, dibatasi garis pemisah.
+fn segment_bar(ui: &mut egui::Ui, segments: &[(u64, u64, u64)], total: Option<u64>) {
+    let width = ui.available_width();
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    let dark = ui.visuals().dark_mode;
+    let bg = if dark { egui::Color32::from_gray(38) } else { egui::Color32::from_gray(245) };
+    let pending = if dark { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(210) };
+    let filled = if dark {
+        egui::Color32::from_rgb(86, 156, 214)
+    } else {
+        egui::Color32::from_rgb(51, 122, 204)
+    };
+    let sep = if dark { egui::Color32::from_gray(96) } else { egui::Color32::from_gray(150) };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, bg);
+    if let Some(total) = total.filter(|t| *t > 0) {
+        let total = total as f32;
+        let x_of = |b: f32| rect.left() + rect.width() * (b / total);
+        for (start, end, dl) in segments {
+            let len = (end - start + 1) as f32;
+            let x0 = x_of(*start as f32);
+            let x1 = x_of((*end + 1) as f32);
+            // Rentang koneksi (porsi belum terunduh) — abu-abu.
+            let span = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x1, rect.bottom()),
+            );
+            painter.rect_filled(span, 0.0, pending);
+            // Porsi terunduh — biru.
+            let fw = (x1 - x0) * (*dl as f32 / len).clamp(0.0, 1.0);
+            let fill = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x0 + fw, rect.bottom()),
+            );
+            painter.rect_filled(fill, 0.0, filled);
+            // Garis pemisah antar-segmen.
+            painter.vline(x1, rect.y_range(), egui::Stroke::new(1.0, sep));
+        }
+    }
+}
+
 fn time_left(r: &Row) -> String {
     if r.status != Status::Active || r.speed_bps == 0 {
         return "—".into();
@@ -2368,6 +2775,21 @@ fn open_path(path: &std::path::Path) {
 /// Buka URL di browser default desktop (`xdg-open`), terlepas.
 fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Aksi daya "Options on completion": jalankan via systemd lalu keluar.
+/// `Exit` hanya menutup app. Best-effort (systemctl tunduk pada polkit/logind).
+fn perform_power(w: WhenDone) {
+    let action = match w {
+        WhenDone::ShutDown => Some("poweroff"),
+        WhenDone::Hibernate => Some("hibernate"),
+        WhenDone::Sleep => Some("suspend"),
+        WhenDone::Exit => None,
+    };
+    if let Some(a) = action {
+        let _ = std::process::Command::new("systemctl").arg(a).spawn();
+    }
+    std::process::exit(0);
 }
 
 fn filename_of(p: &std::path::Path) -> String {

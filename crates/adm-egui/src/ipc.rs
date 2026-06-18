@@ -36,18 +36,77 @@ pub fn try_activate_existing() -> bool {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
         return false;
     };
+    rt.block_on(activate_once(&path))
+}
+
+/// Satu upaya connect+activate ke socket `path`. `true` bila instance hidup
+/// membalas (pemanggil harus keluar).
+async fn activate_once(path: &std::path::Path) -> bool {
+    // Socket basi (tak ada listener) → connect gagal → bukan instance hidup.
+    let Ok(stream) = UnixStream::connect(path).await else {
+        return false;
+    };
+    let mut reader = BufReader::new(stream);
+    let req = Request::new(1, method::APP_ACTIVATE, None);
+    if adm_ipc::write_message(reader.get_mut(), &req).await.is_err() {
+        return false;
+    }
+    // Tunggu balasan singkat agar yakin pesan terproses sebelum kita keluar.
+    adm_ipc::read_message(&mut reader).await.ok().flatten().is_some()
+}
+
+/// Lockfile penanda primary (di-`flock` selama proses hidup). Hanya pembungkus
+/// `File` agar lock terlepas otomatis saat `Drop` (atau saat proses mati —
+/// kernel melepas flock bahkan pada SIGKILL).
+pub struct PrimaryLock(#[allow(dead_code)] std::fs::File);
+
+/// Pemilihan primary yang **atomik**: ambil `flock(LOCK_EX|LOCK_NB)` pada
+/// `adm.lock`. `Some` = kita primary (tahan nilai ini selama proses hidup, lalu
+/// jalankan `serve`). `None` = instance lain sudah/akan jadi primary → pemanggil
+/// harus mengaktifkannya lalu keluar.
+///
+/// Ini menutup race TOCTOU lama: dulu beberapa proses yang lahir nyaris
+/// bersamaan sama-sama lolos cek `socket.exists()` lalu sama-sama bind, sehingga
+/// banyak jendela utama muncul (11 di antaranya tanpa server IPC).
+pub fn acquire_primary() -> Option<PrimaryLock> {
+    acquire_primary_at(&adm_ipc::unix_lock_path())
+}
+
+/// Inti `acquire_primary`, dengan path eksplisit (memudahkan pengujian).
+fn acquire_primary_at(path: &std::path::Path) -> Option<PrimaryLock> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()?;
+    // SAFETY: fd valid selama `file` hidup; flock tak menyentuh memori Rust.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Some(PrimaryLock(file))
+    } else {
+        None // EWOULDBLOCK → primary lain memegang kunci
+    }
+}
+
+/// Kalah race flock: primary lain sedang start tapi mungkin belum mem-bind
+/// socket. Coba activate berulang (hingga ~3 dtk) lalu menyerah. `true` bila
+/// berhasil mengaktifkan primary.
+pub fn activate_with_retry() -> bool {
+    let path = adm_ipc::unix_socket_path();
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        return false;
+    };
     rt.block_on(async move {
-        // Socket basi (tak ada listener) → connect gagal → bukan instance hidup.
-        let Ok(stream) = UnixStream::connect(&path).await else {
-            return false;
-        };
-        let mut reader = BufReader::new(stream);
-        let req = Request::new(1, method::APP_ACTIVATE, None);
-        if adm_ipc::write_message(reader.get_mut(), &req).await.is_err() {
-            return false;
+        for _ in 0..60 {
+            if activate_once(&path).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        // Tunggu balasan singkat agar yakin pesan terproses sebelum kita keluar.
-        adm_ipc::read_message(&mut reader).await.ok().flatten().is_some()
+        false
     })
 }
 
@@ -148,6 +207,23 @@ mod tests {
         adm_ipc::write_message(stream.get_mut(), req).await.unwrap();
         let bytes = adm_ipc::read_message(stream).await.unwrap().unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Hanya satu pemegang flock pada saat bersamaan; setelah dilepas, bisa
+    /// diambil lagi. Ini inti yang mencegah "banyak jendela utama".
+    #[test]
+    fn primary_lock_is_exclusive() {
+        let path = std::env::temp_dir().join(format!("adm-lock-test-{}.lock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let first = acquire_primary_at(&path).expect("primary pertama harus dapat kunci");
+        // Open file description berbeda → flock tetap bentrok meski satu proses.
+        assert!(acquire_primary_at(&path).is_none(), "kunci kedua harus ditolak");
+
+        drop(first); // primary keluar → kunci lepas
+        let second = acquire_primary_at(&path).expect("setelah lepas, kunci tersedia lagi");
+        drop(second);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

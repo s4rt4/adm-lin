@@ -25,6 +25,37 @@ pub fn unix_socket_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("adm-{user}.sock"))
 }
 
+/// Path lockfile single-instance (mendampingi `unix_socket_path`). Dipakai
+/// `flock` untuk pemilihan primary yang atomik — mencegah race "banyak instance
+/// merasa jadi yang pertama" saat beberapa proses lahir nyaris bersamaan
+/// (mis. browser menjalankan satu bridge per-pesan, tiap bridge men-spawn app).
+#[cfg(unix)]
+pub fn unix_lock_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("adm.lock");
+        }
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
+    std::env::temp_dir().join(format!("adm-{user}.lock"))
+}
+
+/// Path lockfile **spawn** untuk bridge. Berbeda dari `unix_lock_path` (yang
+/// dipegang app selama hidup): kunci ini dipegang sebentar oleh satu bridge saat
+/// men-spawn app, agar beberapa bridge yang dijalankan browser bersamaan (satu
+/// per pesan native-messaging) tak ramai-ramai men-spawn app. Harus terpisah
+/// dari kunci app — bila sama, bridge yang memegangnya akan memblokir app.
+#[cfg(unix)]
+pub fn unix_spawn_lock_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return std::path::PathBuf::from(dir).join("adm-spawn.lock");
+        }
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
+    std::env::temp_dir().join(format!("adm-{user}-spawn.lock"))
+}
+
 /// Nama metode yang didukung jalur bridge<->app.
 pub mod method {
     /// Cek apakah `adm-app` hidup. Dipakai bridge & single-instance.

@@ -98,19 +98,42 @@ fn write_message(value: &serde_json::Value) -> std::io::Result<()> {
 }
 
 /// Pastikan app hidup; jika tidak, spawn `adm-egui` terlepas lalu tunggu PING.
+///
+/// Koordinasi via **spawn-lock (flock)**: browser menjalankan satu bridge per
+/// pesan native-messaging, jadi banyak bridge bisa lahir bersamaan. Hanya bridge
+/// yang memegang kunci yang men-spawn app; sisanya cukup menunggu app naik.
+/// (App sendiri sudah single-instance, jadi spawn ganda tak fatal — ini sekadar
+/// menghindari kawanan proses app berumur pendek.)
 async fn ensure_app() -> bool {
     if request(method::PING, None).await.is_ok() {
         return true;
     }
-    if let Some(app) = find_app() {
-        use std::process::Stdio;
-        // Lepaskan stdio agar pipe native-messaging tak diwariskan ke app.
-        let _ = std::process::Command::new(app)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+    match acquire_spawn_lock() {
+        // Kita yang men-spawn. Tahan kunci selama menunggu app naik agar bridge
+        // lain tak ikut spawn (kunci lepas saat `_lock` di-drop di akhir arm).
+        Some(_lock) => {
+            // Cek ulang: app mungkin sudah naik saat kita menunggu kunci.
+            if request(method::PING, None).await.is_ok() {
+                return true;
+            }
+            if let Some(app) = find_app() {
+                use std::process::Stdio;
+                // Lepaskan stdio agar pipe native-messaging tak diwariskan ke app.
+                let _ = std::process::Command::new(app)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+            wait_for_app().await
+        }
+        // Bridge lain sedang men-spawn — cukup tunggu app naik.
+        None => wait_for_app().await,
     }
+}
+
+/// Tunggu app membalas PING (hingga ~5 dtk). `true` bila app naik.
+async fn wait_for_app() -> bool {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if request(method::PING, None).await.is_ok() {
@@ -118,6 +141,27 @@ async fn ensure_app() -> bool {
         }
     }
     false
+}
+
+/// Ambil spawn-lock (flock non-blok). `Some` = kita berhak men-spawn; `None` =
+/// bridge lain sedang men-spawn. Kunci lepas otomatis saat `File` di-drop.
+fn acquire_spawn_lock() -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let path = adm_ipc::unix_spawn_lock_path();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    // SAFETY: fd valid selama `file` hidup; flock tak menyentuh memori Rust.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Some(file)
+    } else {
+        None
+    }
 }
 
 /// Cari binary `adm-egui`: di samping bridge (instalasi), lalu andalkan PATH.
