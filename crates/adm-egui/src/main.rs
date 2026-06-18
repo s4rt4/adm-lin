@@ -250,6 +250,8 @@ struct ProgressUi {
     tab: usize,
     /// Area detail (segment bar + tabel koneksi) tampil — tombol Hide/Show details.
     details: bool,
+    /// Tampilkan URL unduhan (default sembunyi — link panjang merusak layout).
+    show_url: bool,
     // Tab Speed Limiter.
     limit_on: bool,
     limit_kbps: u64,
@@ -262,6 +264,7 @@ impl Default for ProgressUi {
         Self {
             tab: 0,
             details: true,
+            show_url: false,
             limit_on: false,
             limit_kbps: 0,
             completion: CompletionOpts::default(),
@@ -581,9 +584,11 @@ impl AdmApp {
                         r.status = Status::Completed;
                         dirty = true;
                     }
-                    // "Options on completion": tampilkan dialog complete / antrekan
+                    // Jendela proses auto-tutup saat selesai (digantikan jendela
+                    // complete). "Options on completion": dialog complete / antrekan
                     // exit / aksi daya (dieksekusi setelah persist di bawah).
                     if let Some(opts) = self.completion.get(&id).copied() {
+                        self.progress_open.remove(&id);
                         if opts.show_complete {
                             self.complete_open.insert(id);
                         }
@@ -2071,7 +2076,7 @@ impl AdmApp {
                     ui.separator();
 
                     match st.tab {
-                        0 => Self::pg_tab_status(ui, id, r, st.details),
+                        0 => Self::pg_tab_status(ui, id, r, &mut st),
                         1 => {
                             if Self::pg_tab_limiter(ui, &mut st) {
                                 let bps = if st.limit_on { st.limit_kbps * 1024 } else { 0 };
@@ -2156,10 +2161,17 @@ impl AdmApp {
 
     /// Tab 1: "Download status" — info + progress bar + (detail) segment bar &
     /// tabel koneksi (N. / Downloaded / Info), mirror versi Windows.
-    fn pg_tab_status(ui: &mut egui::Ui, id: u64, r: &Row, details: bool) {
+    fn pg_tab_status(ui: &mut egui::Ui, id: u64, r: &Row, st: &mut ProgressUi) {
         ui.add_space(4.0);
         ui.strong(&r.filename);
-        ui.weak(&r.url);
+        // URL disembunyikan default — link panjang bikin layout jelek. Toggle.
+        let link_label = if st.show_url { "▾ Hide link" } else { "▸ Show link" };
+        if ui.small_button(link_label).clicked() {
+            st.show_url = !st.show_url;
+        }
+        if st.show_url {
+            ui.add(egui::Label::new(egui::RichText::new(&r.url).weak().small()));
+        }
         ui.add_space(6.0);
         egui::Grid::new(format!("pg-grid-{id}"))
             .num_columns(2)
@@ -2199,7 +2211,7 @@ impl AdmApp {
         };
         ui.add(egui::ProgressBar::new(frac).show_percentage());
 
-        if details {
+        if st.details {
             ui.add_space(10.0);
             ui.label("Start positions and download progress by connections:");
             ui.add_space(4.0);
@@ -2299,7 +2311,8 @@ impl AdmApp {
             let path = self.row_path(&self.rows[i]);
             let r = &self.rows[i];
             let mut open = true;
-            egui::Window::new(format!("Download complete##cmpl-{id}"))
+            egui::Window::new("Download complete")
+                .id(egui::Id::new(("cmpl", id)))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
