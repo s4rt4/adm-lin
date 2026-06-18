@@ -6,8 +6,10 @@ mod autostart;
 mod category;
 mod engine;
 mod ipc;
+mod scheduler;
 mod settings;
 mod store;
+mod tasks;
 mod tray;
 
 use category::Category;
@@ -15,11 +17,11 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use engine::{EngineEvent, EngineHandle};
 use ipc::IpcCommand;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 fn main() -> eframe::Result<()> {
@@ -153,9 +155,30 @@ impl Row {
             Filter::Unfinished => self.status != Status::Completed,
             Filter::Finished => self.status == Status::Completed,
             Filter::Queues => self.status == Status::Queued,
+            // Grabber ditangani lewat keanggotaan set (lihat `in_filter`).
             Filter::Grabber => false,
         }
     }
+}
+
+/// Apakah baris cocok dengan filter. Sama dgn `Row::matches`, kecuali Grabber
+/// yang dicocokkan via set id (baris hasil site-grabber, dicatat in-memory).
+fn in_filter(r: &Row, f: Filter, grabber: &HashSet<u64>) -> bool {
+    match f {
+        Filter::Grabber => grabber.contains(&r.id),
+        _ => r.matches(f),
+    }
+}
+
+/// Status dialog Site Grabber, diisi oleh task async `grab_links`.
+#[derive(Default)]
+struct GrabState {
+    fetching: bool,
+    /// Sudah pernah Fetch (agar bedakan "kosong" vs "belum jalan").
+    done: bool,
+    links: Vec<String>,
+    checked: Vec<bool>,
+    error: Option<String>,
 }
 
 struct AdmApp {
@@ -185,6 +208,23 @@ struct AdmApp {
     // Dialog Refresh Link (id baris target + buffer URL baru).
     refresh_target: Option<u64>,
     refresh_url: String,
+    // Dialog batch download.
+    show_batch: bool,
+    batch_text: String,
+    // Dialog site grabber.
+    show_grabber: bool,
+    grab_url: String,
+    grab: Arc<Mutex<GrabState>>,
+    /// Id baris yang berasal dari site-grabber (untuk node sidebar "Grabber").
+    grabber_ids: HashSet<u64>,
+    // Find.
+    show_find: bool,
+    find_query: String,
+    /// Indeks baris (dalam daftar tampak) yang akan di-scroll oleh tabel.
+    find_scroll: Option<usize>,
+    // Dialog Scheduler (salinan kerja; disimpan ke scheduler.json saat OK).
+    show_scheduler: bool,
+    sched_edit: scheduler::Schedule,
     /// `true` bila tray SNI berhasil didaftarkan. Menentukan perilaku tombol
     /// tutup jendela: ada tray → sembunyikan ke tray; tanpa tray (mis. GNOME
     /// polos) → minimize ke dock agar jendela selalu bisa dipanggil kembali.
@@ -236,6 +276,9 @@ impl AdmApp {
         let tray_active = Arc::new(AtomicBool::new(false));
         tray::launch(engine.clone(), cc.egui_ctx.clone(), tray_active.clone());
 
+        // Scheduler: thread pemicu start/stop antrian otomatis (jam & hari).
+        scheduler::start(engine.clone());
+
         // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
         let (rows, max_id) = store::load();
         if max_id > 0 {
@@ -269,6 +312,17 @@ impl AdmApp {
             show_about: false,
             refresh_target: None,
             refresh_url: String::new(),
+            show_batch: false,
+            batch_text: String::new(),
+            show_grabber: false,
+            grab_url: String::new(),
+            grab: Arc::new(Mutex::new(GrabState::default())),
+            grabber_ids: HashSet::new(),
+            show_find: false,
+            find_query: String::new(),
+            find_scroll: None,
+            show_scheduler: false,
+            sched_edit: scheduler::get(),
             tray_active,
             dark: cfg.dark,
         }
@@ -601,6 +655,132 @@ impl AdmApp {
         }
         self.refresh_url.clear();
     }
+
+    // ---- Batch download ----
+
+    /// Buka dialog batch kosong (Tasks → Add batch download...).
+    fn open_batch(&mut self) {
+        self.batch_text.clear();
+        self.show_batch = true;
+    }
+
+    /// Buka dialog batch dengan URL hasil ekstraksi dari clipboard
+    /// (Tasks → Add batch download from clipboard).
+    fn open_batch_from_clipboard(&mut self) {
+        let text = tasks::read_clipboard().unwrap_or_default();
+        self.batch_text = tasks::extract_urls(&text).join("\n");
+        self.show_batch = true;
+    }
+
+    /// Enqueue semua URL hasil parse teks batch (wildcard diekspansi).
+    fn add_batch(&mut self) {
+        let urls = tasks::parse_batch(&self.batch_text);
+        for url in urls {
+            self.engine.enqueue(adm_ipc::DownloadAddParams {
+                url,
+                ..Default::default()
+            });
+        }
+        self.batch_text.clear();
+        self.show_batch = false;
+    }
+
+    // ---- Site grabber ----
+
+    /// Buka dialog site grabber (reset state hasil sebelumnya).
+    fn open_grabber(&mut self) {
+        self.grab_url.clear();
+        *self.grab.lock().unwrap() = GrabState::default();
+        self.show_grabber = true;
+    }
+
+    /// Mulai ambil tautan dari URL halaman (async di runtime engine).
+    fn fetch_grabber(&self, ctx: &egui::Context) {
+        let url = self.grab_url.trim().to_string();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            self.grab.lock().unwrap().error = Some("URL halaman tidak valid.".into());
+            return;
+        }
+        {
+            let mut g = self.grab.lock().unwrap();
+            g.fetching = true;
+            g.error = None;
+        }
+        let state = self.grab.clone();
+        let ctx = ctx.clone();
+        self.engine.runtime().spawn(async move {
+            let res = adm_core::grab_links(&url).await;
+            {
+                let mut g = state.lock().unwrap();
+                g.fetching = false;
+                g.done = true;
+                match res {
+                    Ok(links) => {
+                        g.checked = vec![true; links.len()];
+                        g.links = links;
+                        g.error = None;
+                    }
+                    Err(e) => g.error = Some(e.to_string()),
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Enqueue tautan grabber yang tercentang; catat id untuk node "Grabber".
+    fn download_grabbed(&mut self, urls: Vec<String>) {
+        for url in urls {
+            let id = self.engine.enqueue(adm_ipc::DownloadAddParams {
+                url,
+                ..Default::default()
+            });
+            self.grabber_ids.insert(id);
+        }
+        self.show_grabber = false;
+    }
+
+    // ---- Find ----
+
+    /// Cari (substring, case-insensitive) pada nama berkas di daftar tampak,
+    /// melingkar. `from_next` → mulai setelah baris terpilih (Find Next).
+    fn run_find(&mut self, from_next: bool) {
+        let q = self.find_query.trim().to_lowercase();
+        if q.is_empty() {
+            return;
+        }
+        let visible: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| in_filter(&self.rows[i], self.filter, &self.grabber_ids))
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        let start = if from_next {
+            self.selected
+                .and_then(|sel| visible.iter().position(|&i| self.rows[i].id == sel))
+                .map(|p| p + 1)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let n = visible.len();
+        for off in 0..n {
+            let vi = (start + off) % n;
+            let r = &self.rows[visible[vi]];
+            if r.filename.to_lowercase().contains(&q) {
+                self.selected = Some(r.id);
+                self.find_scroll = Some(vi);
+                return;
+            }
+        }
+    }
+
+    // ---- Scheduler ----
+
+    /// Buka dialog Scheduler dengan setelan terkini.
+    fn open_scheduler(&mut self) {
+        self.sched_edit = scheduler::get();
+        self.show_scheduler = true;
+    }
 }
 
 impl eframe::App for AdmApp {
@@ -608,6 +788,14 @@ impl eframe::App for AdmApp {
         self.drain_events();
         self.drain_ipc(ui.ctx());
         self.handle_close(ui.ctx());
+
+        // Pintasan: Ctrl+F = Find, F3 = Find Next.
+        if ui.ctx().input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            self.show_find = true;
+        }
+        if ui.ctx().input(|i| i.key_pressed(egui::Key::F3)) {
+            self.run_find(true);
+        }
 
         self.menu_bar(ui);
         self.toolbar(ui);
@@ -618,6 +806,10 @@ impl eframe::App for AdmApp {
         self.options_dialog(ui);
         self.about_dialog(ui);
         self.refresh_dialog(ui);
+        self.batch_dialog(ui);
+        self.grabber_dialog(ui);
+        self.find_dialog(ui);
+        self.scheduler_dialog(ui);
     }
 }
 
@@ -633,9 +825,18 @@ impl AdmApp {
                         self.show_add = true;
                         ui.close();
                     }
-                    ui.add_enabled(false, egui::Button::new("Add batch download..."));
-                    ui.add_enabled(false, egui::Button::new("Add batch download from clipboard"));
-                    ui.add_enabled(false, egui::Button::new("Run site grabber..."));
+                    if ui.button("Add batch download...").clicked() {
+                        self.open_batch();
+                        ui.close();
+                    }
+                    if ui.button("Add batch download from clipboard").clicked() {
+                        self.open_batch_from_clipboard();
+                        ui.close();
+                    }
+                    if ui.button("Run site grabber...").clicked() {
+                        self.open_grabber();
+                        ui.close();
+                    }
                     ui.separator();
                     ui.add_enabled(false, egui::Button::new("Export..."));
                     ui.add_enabled(false, egui::Button::new("Import..."));
@@ -680,10 +881,19 @@ impl AdmApp {
                         ui.close();
                     }
                     ui.separator();
-                    ui.add_enabled(false, egui::Button::new("Find...\tCtrl+F"));
-                    ui.add_enabled(false, egui::Button::new("Find Next\tF3"));
+                    if ui.button("Find...\tCtrl+F").clicked() {
+                        self.show_find = true;
+                        ui.close();
+                    }
+                    if ui.add_enabled(!self.find_query.is_empty(), egui::Button::new("Find Next\tF3")).clicked() {
+                        self.run_find(true);
+                        ui.close();
+                    }
                     ui.separator();
-                    ui.add_enabled(false, egui::Button::new("Scheduler..."));
+                    if ui.button("Scheduler...").clicked() {
+                        self.open_scheduler();
+                        ui.close();
+                    }
                     if ui.button("Start queue").clicked() {
                         self.engine.start_queue();
                         ui.close();
@@ -752,6 +962,9 @@ impl AdmApp {
                 .selected_row()
                 .map(|r| r.status == Status::Active)
                 .unwrap_or(false);
+            let queued = self.rows.iter().filter(|r| r.status == Status::Queued).count();
+            let sched = scheduler::get();
+            let mut open_sched = false;
 
             ui.horizontal(|ui| {
                 // Urutan persis versi Windows (adm-app/gui.rs::add_toolbar_buttons).
@@ -778,7 +991,9 @@ impl AdmApp {
                 if tbtn(ui, icon_options(), "Options", true) {
                     self.open_options();
                 }
-                tbtn(ui, icon_scheduler(), "Scheduler", false);
+                if tbtn(ui, icon_scheduler(), "Scheduler", true) {
+                    open_sched = true;
+                }
                 if tbtn(ui, icon_refresh_link(), "Refresh Link", has_sel) {
                     self.open_refresh();
                 }
@@ -787,24 +1002,25 @@ impl AdmApp {
                 if sq_clicked {
                     self.engine.start_queue();
                 }
-                egui::Popup::menu(&sq_arrow).show(|ui| {
-                    ui.set_min_width(170.0);
-                    ui.weak("(belum ada antrian)");
-                });
+                if queue_popup(&sq_arrow, queued, &sched) {
+                    open_sched = true;
+                }
                 let (tq_clicked, tq_arrow) = tbtn_dd(ui, icon_stop_queue(), "Stop Queue", true);
                 if tq_clicked {
                     self.engine.stop_queue();
                 }
-                egui::Popup::menu(&tq_arrow).show(|ui| {
-                    ui.set_min_width(170.0);
-                    ui.weak("(belum ada antrian)");
-                });
+                if queue_popup(&tq_arrow, queued, &sched) {
+                    open_sched = true;
+                }
                 ui.separator();
                 if tbtn(ui, icon_updates(), "Updates", true) {
                     open_url("https://github.com/s4rt4/adm-lin");
                 }
             });
             ui.add_space(4.0);
+            if open_sched {
+                self.open_scheduler();
+            }
         });
     }
 
@@ -831,7 +1047,9 @@ impl AdmApp {
             .default_size(180.0)
             .show_inside(ui, |ui| {
                 ui.add_space(4.0);
-                let count = |f: Filter| self.rows.iter().filter(|r| r.matches(f)).count();
+                let grabber = &self.grabber_ids;
+                let rows = &self.rows;
+                let count = |f: Filter| rows.iter().filter(|r| in_filter(r, f, grabber)).count();
                 let node = |ui: &mut egui::Ui, cur: &mut Filter, f: Filter, label: &str, indent: bool| {
                     let txt = format!("{label} ({})", count(f));
                     ui.horizontal(|ui| {
@@ -865,7 +1083,7 @@ impl AdmApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let filter = self.filter;
             let visible: Vec<usize> = (0..self.rows.len())
-                .filter(|&i| self.rows[i].matches(filter))
+                .filter(|&i| in_filter(&self.rows[i], filter, &self.grabber_ids))
                 .collect();
 
             let mut clicked: Option<u64> = None;
@@ -876,7 +1094,7 @@ impl AdmApp {
                 let full = ui.max_rect();
                 egui::Rect::from_min_max(egui::pos2(full.left(), top), full.max)
             };
-            TableBuilder::new(ui)
+            let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .sense(egui::Sense::click())
@@ -888,7 +1106,12 @@ impl AdmApp {
                 .column(Column::initial(90.0).at_least(60.0)) // Time left
                 .column(Column::initial(110.0).at_least(70.0)) // Transfer rate
                 .column(Column::initial(130.0).at_least(80.0)) // Last Try
-                .column(Column::remainder().at_least(80.0)) // Description
+                .column(Column::remainder().at_least(80.0)); // Description
+            // Scroll ke baris hasil Find (sekali, lalu reset).
+            if let Some(idx) = self.find_scroll.take() {
+                table = table.scroll_to_row(idx, Some(egui::Align::Center));
+            }
+            table
                 .header(26.0, |mut h| {
                     for title in ["File Name", "Q", "Size", "Status", "Time left", "Transfer rate", "Last Try", "Description"] {
                         h.col(|ui| {
@@ -1202,6 +1425,233 @@ impl AdmApp {
             self.refresh_url.clear();
         }
     }
+
+    fn batch_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_batch {
+            return;
+        }
+        let mut open = true;
+        let mut add = false;
+        egui::Window::new("Add batch download")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(520.0);
+                ui.label("Masukkan satu URL per baris. Pola angka didukung, mis. file[1-10].zip");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.batch_text)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(12)
+                            .code_editor(),
+                    );
+                });
+                let n = tasks::parse_batch(&self.batch_text).len();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(n > 0, egui::Button::new(format!("Add {n} download(s)"))).clicked() {
+                        add = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.batch_text.clear();
+                        self.show_batch = false;
+                    }
+                });
+            });
+        if add {
+            self.add_batch();
+        }
+        if !open {
+            self.show_batch = false;
+        }
+    }
+
+    fn grabber_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_grabber {
+            return;
+        }
+        let mut open = true;
+        let mut fetch = false;
+        let mut download: Option<Vec<String>> = None;
+        egui::Window::new("Run site grabber")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(560.0);
+                ui.horizontal(|ui| {
+                    ui.label("Page URL:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.grab_url)
+                            .desired_width(380.0)
+                            .hint_text("https://…"),
+                    );
+                    let fetching = self.grab.lock().unwrap().fetching;
+                    if ui.add_enabled(!fetching, egui::Button::new("Fetch")).clicked() {
+                        fetch = true;
+                    }
+                });
+                ui.add_space(6.0);
+
+                let mut g = self.grab.lock().unwrap();
+                if g.fetching {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Mengambil tautan…");
+                    });
+                } else if let Some(e) = g.error.clone() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), e);
+                } else if g.done {
+                    ui.label(format!("{} tautan ditemukan:", g.links.len()));
+                }
+
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    for i in 0..g.links.len() {
+                        let mut on = g.checked[i];
+                        let label = g.links[i].clone();
+                        if ui.checkbox(&mut on, label).changed() {
+                            g.checked[i] = on;
+                        }
+                    }
+                });
+                drop(g);
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let g = self.grab.lock().unwrap();
+                    let sel: Vec<String> = g
+                        .links
+                        .iter()
+                        .zip(g.checked.iter())
+                        .filter(|(_, &c)| c)
+                        .map(|(u, _)| u.clone())
+                        .collect();
+                    drop(g);
+                    if ui
+                        .add_enabled(!sel.is_empty(), egui::Button::new(format!("Download selected ({})", sel.len())))
+                        .clicked()
+                    {
+                        download = Some(sel);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_grabber = false;
+                    }
+                });
+            });
+        if fetch {
+            self.fetch_grabber(ui.ctx());
+        }
+        if let Some(urls) = download {
+            self.download_grabbed(urls);
+        }
+        if !open {
+            self.show_grabber = false;
+        }
+    }
+
+    fn find_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_find {
+            return;
+        }
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Find")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(360.0);
+                ui.label("Cari berkas (nama):");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.find_query)
+                        .desired_width(f32::INFINITY),
+                );
+                resp.request_focus();
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Find").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.show_find = false;
+                    }
+                });
+            });
+        if go {
+            self.run_find(false);
+            self.show_find = false;
+        }
+        if !open {
+            self.show_find = false;
+        }
+    }
+
+    fn scheduler_dialog(&mut self, ui: &mut egui::Ui) {
+        if !self.show_scheduler {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        egui::Window::new("Scheduler")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(420.0);
+                ui.checkbox(&mut self.sched_edit.enabled, "Aktifkan penjadwalan otomatis");
+                ui.add_space(6.0);
+                egui::Grid::new("sched_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("Mulai antrian:");
+                    time_picker(ui, "sched_start", &mut self.sched_edit.start);
+                    ui.end_row();
+                    ui.label("Hentikan antrian:");
+                    time_picker(ui, "sched_stop", &mut self.sched_edit.stop);
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+                ui.label("Hari aktif:");
+                ui.horizontal(|ui| {
+                    for (i, name) in ["Min", "Sen", "Sel", "Rab", "Kam", "Jum", "Sab"].iter().enumerate() {
+                        ui.toggle_value(&mut self.sched_edit.days[i], *name);
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.show_scheduler = false;
+                    }
+                });
+            });
+        if save {
+            scheduler::set(self.sched_edit.clone());
+            self.show_scheduler = false;
+        }
+        if !open {
+            self.show_scheduler = false;
+        }
+    }
+}
+
+/// Pemilih jam:menit (dua DragValue) untuk dialog Scheduler.
+fn time_picker(ui: &mut egui::Ui, id: &str, t: &mut (u8, u8)) {
+    ui.horizontal(|ui| {
+        ui.add(egui::DragValue::new(&mut t.0).range(0..=23).custom_formatter(|n, _| format!("{:02}", n as u32)));
+        ui.label(":");
+        ui.add(egui::DragValue::new(&mut t.1).range(0..=59).custom_formatter(|n, _| format!("{:02}", n as u32)));
+        let _ = id;
+    });
 }
 
 /// Tombol toolbar gaya IDM: ikon besar di atas, teks di bawah (vertikal).
@@ -1344,6 +1794,30 @@ fn tbtn_dd(
         .add(egui::Shape::convex_polygon(tri, text_color, egui::Stroke::NONE));
 
     (enabled && main_resp.clicked(), arrow_resp)
+}
+
+/// Popup dropdown tombol queue: ringkas jumlah antrian + status scheduler, plus
+/// pintasan membuka dialog Scheduler. Mengembalikan true bila Scheduler diklik.
+fn queue_popup(arrow: &egui::Response, queued: usize, sched: &scheduler::Schedule) -> bool {
+    let mut open_sched = false;
+    egui::Popup::menu(arrow).show(|ui| {
+        ui.set_min_width(220.0);
+        ui.label(format!("Antrian: {queued} menunggu"));
+        ui.separator();
+        if sched.enabled {
+            ui.label(format!(
+                "Jadwal: {:02}:{:02}–{:02}:{:02}",
+                sched.start.0, sched.start.1, sched.stop.0, sched.stop.1
+            ));
+        } else {
+            ui.weak("Jadwal: nonaktif");
+        }
+        if ui.button("Scheduler…").clicked() {
+            open_sched = true;
+            ui.close();
+        }
+    });
+    open_sched
 }
 
 // Ikon Lucide (sama dengan versi Windows); di-embed saat kompilasi.
