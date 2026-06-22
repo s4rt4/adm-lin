@@ -26,6 +26,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # async-std (bukan tokio) agar zbus tetap pakai async-io — selaras dgn tray ksni
 # yang juga async-io (fitur tokio akan memaksa zbus global ke tokio → panic tray).
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+# Ikon tipe-berkas dari tema ikon sistem (gaya IDM): MIME→nama ikon→path tema.
+mime_guess = "2"
+freedesktop-icons = "0.4"
+# Dekode ikon raster (tema yang pakai PNG); SVG dirender via resvg yang sudah ada.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 tiny_http = "0.12"

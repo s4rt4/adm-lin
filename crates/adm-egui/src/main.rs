@@ -5,6 +5,7 @@
 mod autostart;
 mod category;
 mod engine;
+mod fileicon;
 mod ipc;
 mod scheduler;
 mod settings;
@@ -308,6 +309,18 @@ struct AdmApp {
     add_category: Category,
     add_filename: String,
     add_size: Arc<Mutex<SizeState>>,
+    /// Nama berkas hasil probe (Content-Disposition) — diisi async, dikonsumsi
+    /// sekali oleh dialog Add (mengisi "Save As" bila user belum mengetik manual).
+    add_probe_name: Arc<Mutex<Option<String>>>,
+    /// `true` bila user mengetik sendiri di "Save As" → jangan ditimpa hasil probe.
+    add_filename_edited: bool,
+    /// `false` saat dialog Add baru dibuka → frame berikut posisikan jendela
+    /// viewport-nya ke tengah layar & fokus (sekali).
+    add_centered: bool,
+    /// Tema ikon sistem aktif (untuk ikon tipe-berkas gaya IDM).
+    icon_theme: String,
+    /// Cache tekstur ikon tipe-berkas per-ekstensi (lower-case).
+    icon_cache: HashMap<String, Option<egui::TextureHandle>>,
     /// `true` bila dialog dibuka dari browser/bridge → judul "Download File Info".
     add_info: bool,
     /// Metadata titipan browser (referrer/UA/cookie) untuk add via IPC; dipakai
@@ -437,6 +450,11 @@ impl AdmApp {
             add_category: Category::General,
             add_filename: String::new(),
             add_size: Arc::new(Mutex::new(SizeState::Idle)),
+            add_probe_name: Arc::new(Mutex::new(None)),
+            add_filename_edited: false,
+            add_centered: false,
+            icon_theme: fileicon::detect_theme(),
+            icon_cache: HashMap::new(),
             add_info: false,
             pending_add: None,
             cat_override: HashMap::new(),
@@ -517,8 +535,9 @@ impl AdmApp {
                     self.add_url = params.url.clone();
                     let fname = params.filename.clone().unwrap_or_default();
                     self.pending_add = Some(params);
+                    // Dialog Add kini jendela viewport tersendiri yang muncul di
+                    // tengah & di atas browser — tak perlu menaikkan jendela utama.
                     self.open_add(ctx, true, &fname);
-                    Self::bring_to_front(ctx);
                 }
                 IpcCommand::Activate => Self::bring_to_front(ctx),
             }
@@ -711,7 +730,12 @@ impl AdmApp {
             String::new()
         };
         self.add_category = Category::from_filename(&self.add_filename);
+        // Nama dari hint browser dianggap "sudah pasti" → jangan ditimpa probe.
+        self.add_filename_edited = !filename_hint.is_empty();
+        // Jendela dialog (viewport) belum dipusatkan untuk pembukaan ini.
+        self.add_centered = false;
         *self.add_size.lock().unwrap() = SizeState::Idle;
+        *self.add_probe_name.lock().unwrap() = None;
         let url = self.add_url.trim().to_string();
         if !url.is_empty() {
             self.probe_add_size(ctx, url);
@@ -719,16 +743,41 @@ impl AdmApp {
         self.show_add = true;
     }
 
-    /// Probe ukuran URL (async) untuk ditampilkan di dialog Add.
+    /// Probe URL (async): ukuran + nama berkas (Content-Disposition) untuk dialog Add.
     fn probe_add_size(&self, ctx: &egui::Context, url: String) {
         *self.add_size.lock().unwrap() = SizeState::Probing;
-        let slot = self.add_size.clone();
+        let size_slot = self.add_size.clone();
+        let name_slot = self.add_probe_name.clone();
         let ctx = ctx.clone();
         self.engine.runtime().spawn(async move {
-            let total = adm_core::probe_url(&url).await.ok().and_then(|p| p.total);
-            *slot.lock().unwrap() = SizeState::Known(total);
+            let probe = adm_core::probe_url(&url).await.ok();
+            let total = probe.as_ref().and_then(|p| p.total);
+            let name = probe.as_ref().and_then(|p| p.suggested_filename.clone());
+            *size_slot.lock().unwrap() = SizeState::Known(total);
+            if name.is_some() {
+                *name_slot.lock().unwrap() = name;
+            }
             ctx.request_repaint();
         });
+    }
+
+    /// Tekstur ikon tipe-berkas (tema sistem) untuk `filename`, di-cache per-ekstensi.
+    fn file_icon(&mut self, ctx: &egui::Context, filename: &str) -> Option<egui::TextureHandle> {
+        let key = std::path::Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if let Some(slot) = self.icon_cache.get(&key) {
+            return slot.clone();
+        }
+        let tex = fileicon::lookup(filename, &self.icon_theme, 48)
+            .and_then(|p| fileicon::load(&p, 48))
+            .map(|img| {
+                ctx.load_texture(format!("fileicon-{key}"), img, egui::TextureOptions::LINEAR)
+            });
+        self.icon_cache.insert(key, tex.clone());
+        tex
     }
 
     fn resume_selected(&mut self) {
@@ -1099,7 +1148,7 @@ impl eframe::App for AdmApp {
         self.status_bar(ui);
         self.sidebar(ui);
         self.table(ui);
-        self.add_dialog(ui);
+        self.add_dialog(ui.ctx());
         self.options_dialog(ui);
         self.about_dialog(ui);
         self.refresh_dialog(ui);
@@ -1565,74 +1614,110 @@ impl AdmApp {
         });
     }
 
-    fn add_dialog(&mut self, ui: &mut egui::Ui) {
+    fn add_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_add {
             return;
         }
-        let mut open = true;
         let mut action: Option<bool> = None; // Some(later)
         let mut reprobe = false;
+        let mut close = false;
+        // Terapkan nama berkas hasil probe (Content-Disposition) bila user belum
+        // mengetik manual — agar "Save As" tak terhenti di download.bin.
+        if let Some(name) = self.add_probe_name.lock().unwrap().take() {
+            if !self.add_filename_edited && !name.trim().is_empty() {
+                self.add_filename = name;
+                self.add_category = Category::from_filename(&self.add_filename);
+            }
+        }
+        // Ikon tipe-berkas dari tema sistem (gaya IDM) + teks ukuran.
+        let icon = self.file_icon(ctx, &self.add_filename.clone());
+        let size_txt = match *self.add_size.lock().unwrap() {
+            SizeState::Idle => "—".to_string(),
+            SizeState::Probing => "menghitung…".to_string(),
+            SizeState::Known(Some(n)) => human_bytes(n),
+            SizeState::Known(None) => "Tidak diketahui".to_string(),
+        };
         // Judul mengikuti versi Windows (browser → "Download File Info").
         let title = if self.add_info { "Download File Info" } else { "Add new download" };
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .open(&mut open)
-            .show(ui.ctx(), |ui| {
-                ui.set_min_width(480.0);
-                egui::Grid::new("add_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                    ui.label("URL:");
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.add_url)
-                            .desired_width(380.0)
-                            .hint_text("https://…"),
-                    );
-                    if !self.add_info {
-                        resp.request_focus();
-                    }
-                    // URL selesai diedit (fokus lepas) → probe ukuran & tebak nama.
-                    if resp.lost_focus() {
-                        reprobe = true;
-                    }
-                    ui.end_row();
 
-                    ui.label("Category:");
-                    egui::ComboBox::from_id_salt("add_cat")
-                        .selected_text(self.add_category.label())
-                        .show_ui(ui, |ui| {
-                            for cat in [
-                                Category::General,
-                                Category::Compressed,
-                                Category::Documents,
-                                Category::Music,
-                                Category::Programs,
-                                Category::Video,
-                            ] {
-                                ui.selectable_value(&mut self.add_category, cat, cat.label());
-                            }
-                        });
-                    ui.end_row();
+        // Dialog = jendela OS tersendiri (viewport) agar mengambang bebas, terlepas
+        // dari jendela utama: muncul di tengah layar & (saat dipicu ekstensi) di atas
+        // jendela browser yang sedang fokus — bukan ikut induk di dock.
+        let vid = egui::ViewportId::from_hash_of("adm-add-dialog");
+        let win_size = egui::vec2(560.0, 230.0);
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(win_size)
+            .with_resizable(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false);
+        if self.add_info {
+            builder = builder.with_window_level(egui::WindowLevel::AlwaysOnTop);
+        }
 
-                    ui.label("Save As:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.add_filename)
-                            .desired_width(380.0)
-                            .hint_text("nama berkas"),
-                    );
-                    ui.end_row();
+        ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    egui::Grid::new("add_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                        ui.label("URL:");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.add_url)
+                                .desired_width(360.0)
+                                .hint_text("https://…"),
+                        );
+                        // URL selesai diedit (fokus lepas) → probe ukuran & tebak nama.
+                        if resp.lost_focus() {
+                            reprobe = true;
+                        }
+                        ui.end_row();
 
-                    ui.label("Size:");
-                    let size_txt = match *self.add_size.lock().unwrap() {
-                        SizeState::Idle => "—".to_string(),
-                        SizeState::Probing => "menghitung…".to_string(),
-                        SizeState::Known(Some(n)) => human_bytes(n),
-                        SizeState::Known(None) => "Tidak diketahui".to_string(),
-                    };
-                    ui.label(size_txt);
-                    ui.end_row();
+                        ui.label("Category:");
+                        egui::ComboBox::from_id_salt("add_cat")
+                            .selected_text(self.add_category.label())
+                            .show_ui(ui, |ui| {
+                                for cat in [
+                                    Category::General,
+                                    Category::Compressed,
+                                    Category::Documents,
+                                    Category::Music,
+                                    Category::Programs,
+                                    Category::Video,
+                                ] {
+                                    ui.selectable_value(&mut self.add_category, cat, cat.label());
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("Save As:");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.add_filename)
+                                .desired_width(360.0)
+                                .hint_text("nama berkas"),
+                        );
+                        // User mengetik sendiri → jangan ditimpa hasil probe.
+                        if resp.changed() {
+                            self.add_filename_edited = true;
+                        }
+                        ui.end_row();
+                    });
+
+                    // Kolom kanan gaya IDM: ikon tipe-berkas besar + ukuran di bawahnya.
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        if let Some(tex) = &icon {
+                            let src = egui::load::SizedTexture::from_handle(tex);
+                            ui.add(
+                                egui::Image::new(src).fit_to_exact_size(egui::vec2(48.0, 48.0)),
+                            );
+                        } else {
+                            ui.add_space(48.0);
+                        }
+                        ui.add_space(4.0);
+                        ui.label(&size_txt);
+                    });
                 });
-                ui.add_space(10.0);
+                ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     if ui.button("Start Download").clicked() {
                         action = Some(false);
@@ -1641,13 +1726,32 @@ impl AdmApp {
                         action = Some(true);
                     }
                     if ui.button("Cancel").clicked() {
-                        self.add_url.clear();
-                        self.add_filename.clear();
-                        self.pending_add = None;
-                        self.show_add = false;
+                        close = true;
                     }
                 });
             });
+
+            // Pusatkan jendela ke layar & fokus, sekali per pembukaan.
+            if !self.add_centered {
+                if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+                    let pos = ((mon - win_size) * 0.5).max(egui::Vec2::ZERO).to_pos2();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.add_centered = true;
+            }
+            // Tombol X jendela.
+            if ctx.input(|i| i.viewport().close_requested()) {
+                close = true;
+            }
+        });
+
+        if close {
+            self.add_url.clear();
+            self.add_filename.clear();
+            self.pending_add = None;
+            self.show_add = false;
+        }
         if reprobe {
             let url = self.add_url.trim().to_string();
             if self.add_filename.trim().is_empty() && !url.is_empty() {
@@ -1657,12 +1761,8 @@ impl AdmApp {
             if url.is_empty() {
                 *self.add_size.lock().unwrap() = SizeState::Idle;
             } else {
-                self.probe_add_size(ui.ctx(), url);
+                self.probe_add_size(ctx, url);
             }
-        }
-        if !open {
-            self.show_add = false;
-            self.pending_add = None;
         }
         if let Some(later) = action {
             if !self.add_url.trim().is_empty() {
