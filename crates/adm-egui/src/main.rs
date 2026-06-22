@@ -1156,8 +1156,8 @@ impl eframe::App for AdmApp {
         self.grabber_dialog(ui);
         self.find_dialog(ui);
         self.scheduler_dialog(ui);
-        self.progress_dialogs(ui);
-        self.complete_dialogs(ui);
+        self.progress_dialogs(ui.ctx());
+        self.complete_dialogs(ui.ctx());
     }
 }
 
@@ -2124,7 +2124,7 @@ impl AdmApp {
 
     /// Dialog progress/status per-unduhan (gaya IDM): modeless, bisa banyak.
     /// Dialog progress/status gaya IDM (3 tab + segment bar + Hide details).
-    fn progress_dialogs(&mut self, ui: &mut egui::Ui) {
+    fn progress_dialogs(&mut self, ctx: &egui::Context) {
         if self.progress_open.is_empty() {
             return;
         }
@@ -2157,14 +2157,17 @@ impl AdmApp {
                 r.filename.clone()
             };
 
-            let mut open = true;
-            egui::Window::new(title)
-                .id(egui::Id::new(("progress", id)))
-                .collapsible(true)
-                .resizable(true)
-                .default_width(540.0)
-                .open(&mut open)
-                .show(ui.ctx(), |ui| {
+            // Dialog progress = jendela OS tersendiri (viewport), terlepas dari
+            // jendela utama: bisa digeser/ditutup sendiri, tak ikut induk di dock.
+            let vid = egui::ViewportId::from_hash_of(("adm-progress", id));
+            let builder = egui::ViewportBuilder::default()
+                .with_title(&title)
+                .with_inner_size([560.0, 380.0])
+                .with_resizable(true)
+                .with_minimize_button(true);
+            let mut closed = false;
+            ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
                     ui.set_min_width(500.0);
 
                     // ---- Bar tab (emulasi SysTabControl versi Windows) ----
@@ -2224,13 +2227,18 @@ impl AdmApp {
                         });
                     });
                 });
+                // Tombol X jendela.
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    closed = true;
+                }
+            });
             // Persist setelan "Options on completion" (tetap berlaku walau dialog
             // ditutup, dieksekusi saat unduhan selesai).
             self.completion.insert(id, st.completion);
-            if open {
-                self.progress_open.insert(id, st); // kembalikan state dialog
-            } else {
+            if closed {
                 to_close.push(id);
+            } else {
+                self.progress_open.insert(id, st); // kembalikan state dialog
             }
         }
         for id in to_pause {
@@ -2395,7 +2403,7 @@ impl AdmApp {
 
     /// Dialog modeless "Download complete" (gaya IDM §9.14): Open / Open folder /
     /// Close. Dipicu opsi "Show download complete dialog" saat unduhan selesai.
-    fn complete_dialogs(&mut self, ui: &mut egui::Ui) {
+    fn complete_dialogs(&mut self, ctx: &egui::Context) {
         if self.complete_open.is_empty() {
             return;
         }
@@ -2410,15 +2418,17 @@ impl AdmApp {
             };
             let path = self.row_path(&self.rows[i]);
             let r = &self.rows[i];
-            let mut open = true;
-            egui::Window::new("Download complete")
-                .id(egui::Id::new(("cmpl", id)))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .open(&mut open)
-                .show(ui.ctx(), |ui| {
-                    ui.set_min_width(420.0);
+            // Jendela OS tersendiri (viewport), terlepas dari jendela utama.
+            let vid = egui::ViewportId::from_hash_of(("adm-complete", id));
+            let builder = egui::ViewportBuilder::default()
+                .with_title("Download complete")
+                .with_inner_size([440.0, 200.0])
+                .with_resizable(false)
+                .with_minimize_button(false)
+                .with_maximize_button(false);
+            let mut closed = false;
+            ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
+                egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.strong("Download complete");
                     ui.add_space(8.0);
@@ -2440,7 +2450,11 @@ impl AdmApp {
                         }
                     });
                 });
-            if !open {
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    closed = true;
+                }
+            });
+            if closed {
                 to_close.push(id);
             }
         }
