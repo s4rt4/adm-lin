@@ -4,6 +4,7 @@
 
 mod autostart;
 mod category;
+mod checksum;
 mod clipboard;
 mod engine;
 mod fileicon;
@@ -177,6 +178,10 @@ struct Row {
     last_try: SystemTime,
     /// Progres per koneksi `(start, end, downloaded)` — transien (dialog progress).
     segments: Vec<(u64, u64, u64)>,
+    /// Checksum harapan user (`"<algo>:<hex>"`); `None` = tak diverifikasi.
+    expected_sum: Option<String>,
+    /// Hasil verifikasi: `Some(true)` cocok, `Some(false)` gagal, `None` belum.
+    verified: Option<bool>,
 }
 
 impl Row {
@@ -331,6 +336,9 @@ struct AdmApp {
     add_url: String,
     add_category: Category,
     add_filename: String,
+    /// Checksum harapan opsional (hex) + algoritmanya, dari dialog Add.
+    add_checksum: String,
+    add_checksum_algo: checksum::Algo,
     add_size: Arc<Mutex<SizeState>>,
     /// Nama berkas hasil probe (Content-Disposition) — diisi async, dikonsumsi
     /// sekali oleh dialog Add (mengisi "Save As" bila user belum mengetik manual).
@@ -351,6 +359,15 @@ struct AdmApp {
     pending_add: Option<adm_ipc::DownloadAddParams>,
     /// Kategori pilihan user di dialog Add (override deteksi otomatis), per id.
     cat_override: HashMap<u64, Category>,
+    /// Checksum harapan dari dialog Add (`"<algo>:<hex>"`), dikonsumsi di upsert.
+    sum_override: HashMap<u64, String>,
+    /// Id yang sedang diverifikasi (transien; badge "…" di tabel).
+    verifying: HashSet<u64>,
+    /// Hasil verifikasi checksum dari thread latar: (id, cocok?).
+    verify_rx: mpsc::Receiver<(u64, bool)>,
+    verify_tx: mpsc::Sender<(u64, bool)>,
+    /// Clone context egui untuk memicu repaint dari thread latar (verifikasi).
+    repaint: egui::Context,
     /// Dialog progress/status terbuka (gaya IDM, modeless): id → state UI dialog.
     progress_open: HashMap<u64, ProgressUi>,
     /// Setelan "Options on completion" per-id (persist walau dialog ditutup),
@@ -471,6 +488,9 @@ impl AdmApp {
         // Clipboard monitor (thread latar; default mengikuti setelan).
         let clip_monitor = clipboard::ClipMonitor::start(cc.egui_ctx.clone(), cfg.monitor_clipboard);
 
+        // Kanal hasil verifikasi checksum (thread hash → UI).
+        let (verify_tx, verify_rx) = mpsc::channel::<(u64, bool)>();
+
         // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
         let (rows, max_id) = store::load();
         if max_id > 0 {
@@ -497,6 +517,8 @@ impl AdmApp {
             add_url: String::new(),
             add_category: Category::General,
             add_filename: String::new(),
+            add_checksum: String::new(),
+            add_checksum_algo: checksum::Algo::Sha256,
             add_size: Arc::new(Mutex::new(SizeState::Idle)),
             add_probe_name: Arc::new(Mutex::new(None)),
             add_filename_edited: false,
@@ -506,6 +528,11 @@ impl AdmApp {
             add_info: false,
             pending_add: None,
             cat_override: HashMap::new(),
+            sum_override: HashMap::new(),
+            verifying: HashSet::new(),
+            verify_rx,
+            verify_tx,
+            repaint: cc.egui_ctx.clone(),
             progress_open: HashMap::new(),
             completion: HashMap::new(),
             complete_open: HashSet::new(),
@@ -684,6 +711,19 @@ impl AdmApp {
                         if !self.post_run_cmd.trim().is_empty() {
                             run_post_command(&self.post_run_cmd, &path);
                         }
+                        // Verifikasi checksum (bila user menyertakan nilai harapan):
+                        // hitung hash di thread latar, kirim hasil ke verify_rx.
+                        if let Some(expected) = self.rows[i].expected_sum.clone() {
+                            self.rows[i].verified = None;
+                            self.verifying.insert(id);
+                            let tx = self.verify_tx.clone();
+                            let ctx = self.repaint.clone();
+                            std::thread::spawn(move || {
+                                let ok = checksum::verify(&path, &expected);
+                                let _ = tx.send((id, ok));
+                                ctx.request_repaint();
+                            });
+                        }
                     }
                     // Jendela proses auto-tutup saat selesai (digantikan jendela
                     // complete). "Options on completion": dialog complete / antrekan
@@ -778,6 +818,9 @@ impl AdmApp {
                 error: None,
                 last_try: SystemTime::now(),
                 segments: Vec::new(),
+                // Checksum harapan dari dialog Add (bila ada untuk id ini).
+                expected_sum: self.sum_override.remove(&id),
+                verified: None,
             });
         }
     }
@@ -807,12 +850,19 @@ impl AdmApp {
         };
         // Kategori pilihan user (override deteksi otomatis di upsert).
         self.cat_override.insert(id, self.add_category);
+        // Checksum harapan opsional → diverifikasi saat unduhan selesai.
+        let sum = self.add_checksum.trim();
+        if !sum.is_empty() {
+            self.sum_override
+                .insert(id, checksum::encode_expected(self.add_checksum_algo, sum));
+        }
         // Buka dialog progress/status (gaya IDM) untuk unduhan yang langsung jalan.
         if !later {
             self.progress_open.entry(id).or_default();
         }
         self.add_url.clear();
         self.add_filename.clear();
+        self.add_checksum.clear();
         self.show_add = false;
     }
 
@@ -828,6 +878,7 @@ impl AdmApp {
             String::new()
         };
         self.add_category = Category::from_filename(&self.add_filename);
+        self.add_checksum.clear();
         // Nama dari hint browser dianggap "sudah pasti" → jangan ditimpa probe.
         self.add_filename_edited = !filename_hint.is_empty();
         // Jendela dialog (viewport) belum dipusatkan untuk pembukaan ini.
@@ -1226,6 +1277,21 @@ impl AdmApp {
         Self::bring_to_front(ctx);
     }
 
+    /// Serap hasil verifikasi checksum dari thread latar → set badge per baris.
+    fn drain_verify(&mut self) {
+        let mut changed = false;
+        while let Ok((id, ok)) = self.verify_rx.try_recv() {
+            self.verifying.remove(&id);
+            if let Some(&i) = self.index.get(&id) {
+                self.rows[i].verified = Some(ok);
+                changed = true;
+            }
+        }
+        if changed {
+            store::save(&self.rows);
+        }
+    }
+
     /// Proses hasil dialog Export/Import yang sudah tiba dari portal.
     fn drain_file_pick(&mut self) {
         let pick = self.file_pick.lock().unwrap().take();
@@ -1255,6 +1321,7 @@ impl eframe::App for AdmApp {
         self.drain_ipc(ui.ctx());
         self.drain_file_pick();
         self.drain_clipboard(ui.ctx());
+        self.drain_verify();
         self.handle_close(ui.ctx());
 
         // Pintasan: Ctrl+F = Find, F3 = Find Next.
@@ -1625,7 +1692,32 @@ impl AdmApp {
                                 });
                             });
                             row.col(|ui| {
-                                ui.label(status_text(r));
+                                ui.horizontal(|ui| {
+                                    ui.label(status_text(r));
+                                    // Badge verifikasi checksum (gaya IDM "verified").
+                                    if self.verifying.contains(&r.id) {
+                                        ui.add(egui::Spinner::new().size(12.0))
+                                            .on_hover_text("Verifying checksum…");
+                                    } else {
+                                        match r.verified {
+                                            Some(true) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(40, 160, 40),
+                                                    "✓",
+                                                )
+                                                .on_hover_text("Checksum verified");
+                                            }
+                                            Some(false) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 60, 60),
+                                                    "✗",
+                                                )
+                                                .on_hover_text("Checksum mismatch");
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                });
                             });
                             row.col(|ui| {
                                 ui.label(time_left(r));
@@ -1766,7 +1858,7 @@ impl AdmApp {
         // dari jendela utama: muncul di tengah layar & (saat dipicu ekstensi) di atas
         // jendela browser yang sedang fokus — bukan ikut induk di dock.
         let vid = egui::ViewportId::from_hash_of("adm-add-dialog");
-        let win_size = egui::vec2(560.0, 230.0);
+        let win_size = egui::vec2(560.0, 272.0);
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_inner_size(win_size)
@@ -1821,6 +1913,28 @@ impl AdmApp {
                         if resp.changed() {
                             self.add_filename_edited = true;
                         }
+                        ui.end_row();
+
+                        ui.label("Checksum:");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("add_sum_algo")
+                                .width(86.0)
+                                .selected_text(self.add_checksum_algo.label())
+                                .show_ui(ui, |ui| {
+                                    for a in [
+                                        checksum::Algo::Sha256,
+                                        checksum::Algo::Sha1,
+                                        checksum::Algo::Md5,
+                                    ] {
+                                        ui.selectable_value(&mut self.add_checksum_algo, a, a.label());
+                                    }
+                                });
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.add_checksum)
+                                    .desired_width(264.0)
+                                    .hint_text("opsional — hash untuk verifikasi"),
+                            );
+                        });
                         ui.end_row();
                     });
 

@@ -26,6 +26,10 @@ struct PersistRow {
     status: Status,
     #[serde(default = "SystemTime::now")]
     last_try: SystemTime,
+    #[serde(default)]
+    expected_sum: Option<String>,
+    #[serde(default)]
+    verified: Option<bool>,
 }
 
 impl From<&Row> for PersistRow {
@@ -39,6 +43,8 @@ impl From<&Row> for PersistRow {
             total: r.total,
             status: r.status,
             last_try: r.last_try,
+            expected_sum: r.expected_sum.clone(),
+            verified: r.verified,
         }
     }
 }
@@ -62,6 +68,8 @@ impl PersistRow {
             error: None,
             last_try: self.last_try,
             segments: Vec::new(),
+            expected_sum: self.expected_sum,
+            verified: self.verified,
         }
     }
 }
@@ -140,6 +148,8 @@ mod tests {
             error: Some("boom".into()), // transien
             last_try: SystemTime::UNIX_EPOCH,
             segments: Vec::new(),
+            expected_sum: None,
+            verified: None,
         }
     }
 

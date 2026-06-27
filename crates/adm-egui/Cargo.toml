@@ -35,6 +35,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Default features memakai zbus async-io — selaras tray ksni (JANGAN aktifkan
 # fitur yang memaksa zbus ke tokio → panic "no reactor"). Lihat catatan rfd.
 notify-rust = "4"
+# Verifikasi checksum berkas unduhan (MD5/SHA-1/SHA-256). digest = trait umum.
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tiny_http = "0.12"
