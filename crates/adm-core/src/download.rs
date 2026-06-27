@@ -99,7 +99,7 @@ pub struct ReqHeaders {
     pub cookies: Option<String>,
 }
 
-fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
+pub(crate) fn build_client(insecure: bool, h: &ReqHeaders) -> Result<Client> {
     let ua = h
         .user_agent
         .clone()

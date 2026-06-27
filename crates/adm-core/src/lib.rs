@@ -10,6 +10,7 @@
 mod download;
 mod error;
 mod grabber;
+mod hls;
 mod limiter;
 mod platform;
 mod probe;
@@ -21,6 +22,7 @@ pub use download::{
 };
 pub use error::{Error, Result};
 pub use grabber::{extract_links, grab_links};
+pub use hls::{download_hls, is_hls_url, parse_master, Variant};
 pub use limiter::Limiter;
 pub use probe::{probe, Probe};
 

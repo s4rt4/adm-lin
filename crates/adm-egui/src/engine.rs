@@ -5,7 +5,10 @@
 //! slot terisi item berikutnya (`pump`).
 
 use crate::category::Category;
-use adm_core::{download, CancelToken, DownloadRequest, Limiter, Outcome, Progress, ProgressCb};
+use adm_core::{
+    download, download_hls, is_hls_url, CancelToken, DownloadRequest, Limiter, Outcome, Progress,
+    ProgressCb, ReqHeaders,
+};
 use adm_ipc::DownloadAddParams;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -272,8 +275,14 @@ impl EngineHandle {
         let this = self.clone();
         let global_limiter = self.global_limiter.clone();
         self.handle.spawn(async move {
+            // Stream HLS (.m3u8): unduh & gabung segmen jadi satu berkas .ts
+            // (kategori Video), bukan unduhan berkas-tunggal biasa.
+            let hls = is_hls_url(&params.url);
             // Tentukan nama berkas (Content-Disposition bila nama generik/absen).
-            let name = this.resolve_filename(&params, id).await;
+            let mut name = this.resolve_filename(&params, id).await;
+            if hls {
+                name = hls_output_name(&name);
+            }
             let mut dir = this.download_dir.lock().unwrap().clone();
             if let Some(folder) = Category::from_filename(&name).folder() {
                 dir.push(folder);
@@ -283,16 +292,35 @@ impl EngineHandle {
             // Koreksi nama baris (placeholder Started sudah diemit sinkron).
             (this.sink)(EngineEvent::Renamed { id, output: output.clone() });
 
-            let req = DownloadRequest {
-                url: params.url.clone(),
-                output,
-                connections: 8,
-                insecure: params.insecure,
-                referrer: params.referrer.clone(),
-                user_agent: params.user_agent.clone(),
-                cookies: params.cookies.clone(),
+            let res = if hls {
+                let headers = ReqHeaders {
+                    referrer: params.referrer.clone(),
+                    user_agent: params.user_agent.clone(),
+                    cookies: params.cookies.clone(),
+                };
+                download_hls(
+                    &params.url,
+                    &output,
+                    headers,
+                    params.insecure,
+                    cancel,
+                    Some(on_progress),
+                    per_limiter,
+                    global_limiter,
+                )
+                .await
+            } else {
+                let req = DownloadRequest {
+                    url: params.url.clone(),
+                    output,
+                    connections: 8,
+                    insecure: params.insecure,
+                    referrer: params.referrer.clone(),
+                    user_agent: params.user_agent.clone(),
+                    cookies: params.cookies.clone(),
+                };
+                download(req, cancel, Some(on_progress), per_limiter, global_limiter).await
             };
-            let res = download(req, cancel, Some(on_progress), per_limiter, global_limiter).await;
             this.active.lock().unwrap().remove(&id);
             // Emit event terminal DULU sebelum memulai item antrian berikutnya.
             let ev = match res {
@@ -370,6 +398,21 @@ fn pick_filename(params: &DownloadAddParams, id: u64) -> String {
         }
     }
     format!("download-{id}.bin")
+}
+
+/// Nama keluaran untuk stream HLS: ganti ekstensi `.m3u8` (atau nama generik)
+/// dengan `.ts` agar hasil gabungan segmen bernama wajar & masuk kategori Video.
+fn hls_output_name(name: &str) -> String {
+    let stem = name
+        .strip_suffix(".m3u8")
+        .or_else(|| name.strip_suffix(".M3U8"))
+        .unwrap_or(name);
+    let stem = stem.trim();
+    if stem.is_empty() || stem == "index" || stem == "master" || stem == "playlist" {
+        "video.ts".to_string()
+    } else {
+        format!("{stem}.ts")
+    }
 }
 
 fn sanitize(name: &str) -> String {

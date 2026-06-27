@@ -82,8 +82,22 @@ async function sendToAdm(url, filename, referrer) {
 // catat per-tab & tampilkan panel "Download with ADM" via content script.
 const MEDIA_EXT = /\.(mp4|webm|flv|m4v|mov|mkv|mp3|m4a|aac|ogg|wav|3gp)(\?|$)/i;
 const MEDIA_CT = /^(video|audio)\//i;
-const MANIFEST_CT = /(mpegurl|dash\+xml)/i; // HLS/DASH = Fase 2, dilewati
+// Fase 2: stream HLS (.m3u8). DASH (.mpd) belum didukung engine → tak ditawarkan.
+const HLS_EXT = /\.m3u8(\?|$)/i;
+const HLS_CT = /mpegurl/i;
 const MIN_SIZE = 200 * 1024; // lewati klip kecil/iklan
+
+// Nama keluaran untuk stream HLS: basename tanpa query, ekstensi → .ts.
+function hlsName(url) {
+  try {
+    const base = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
+    const stem = base.replace(/\.m3u8$/i, "");
+    if (stem && !/^(index|master|playlist|chunklist)$/i.test(stem)) return `${stem}.ts`;
+  } catch (e) {
+    /* abaikan */
+  }
+  return "video.ts";
+}
 
 // tabId -> Map(url -> {url, type, size, filename})
 const mediaByTab = new Map();
@@ -141,7 +155,12 @@ chrome.webRequest.onHeadersReceived.addListener(
   (d) => {
     if (!enabled || d.tabId < 0) return;
     const ct = (headerVal(d.responseHeaders, "content-type") || "").toLowerCase();
-    if (MANIFEST_CT.test(ct)) return; // streaming adaptif → belum didukung
+    // Fase 2: playlist HLS → tawarkan sebagai stream (engine unduh & gabung segmen).
+    // Dedupe per-URL (addMedia) menahan reload playlist live. Ukuran tak diketahui.
+    if (HLS_CT.test(ct) || HLS_EXT.test(d.url)) {
+      addMedia(d.tabId, { url: d.url, type: "HLS", size: 0, filename: hlsName(d.url) });
+      return;
+    }
     const isMedia = (MEDIA_CT.test(ct) && !ct.includes("mp2t")) || MEDIA_EXT.test(d.url);
     if (!isMedia) return;
     let size = parseInt(headerVal(d.responseHeaders, "content-length") || "0", 10) || 0;

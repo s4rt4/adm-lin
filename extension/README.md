@@ -30,6 +30,10 @@ hanya diperlukan bila kelak ingin mem-pack `.crx`).
 4. Selesai. Uji:
    - Klik kanan sebuah link → **Download with ADM**, atau
    - Mulai unduhan apa pun → otomatis dibatalkan di browser & diserahkan ke ADM.
+   - **Stream video (HLS)**: putar video di situs yang memakai HLS (`.m3u8`) →
+     panel melayang "▶ Download with ADM" menampilkan item **HLS**; klik → ADM
+     mengunduh semua segmen & menggabungkannya jadi satu `.ts` (mendekripsi
+     AES-128 bila perlu). DASH (`.mpd`) belum didukung.
    - Bila `adm-egui` belum jalan, bridge otomatis men-spawn-nya.
    - Toggle "tangkap unduhan otomatis" ada di popup ikon extension.
 
