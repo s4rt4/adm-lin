@@ -18,6 +18,14 @@ pub struct Settings {
     pub limit_kbps: u64,
     /// Tampilkan notifikasi desktop saat unduhan selesai.
     pub notify_complete: bool,
+    /// Post-action: buka berkas otomatis tiap unduhan selesai.
+    pub post_open: bool,
+    /// Post-action: perintah shell dijalankan tiap unduhan selesai
+    /// (`{}` diganti path berkas; kosong = nonaktif).
+    pub post_run_cmd: String,
+    /// Post-action saat SELURUH antrian selesai:
+    /// `"none"` | `"shutdown"` | `"hibernate"` | `"sleep"` | `"exit"`.
+    pub post_all_action: String,
 }
 
 impl Default for Settings {
@@ -28,6 +36,9 @@ impl Default for Settings {
             queue_max: 1,
             limit_kbps: 0,
             notify_complete: true,
+            post_open: false,
+            post_run_cmd: String::new(),
+            post_all_action: "none".to_string(),
         }
     }
 }

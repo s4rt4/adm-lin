@@ -219,6 +219,27 @@ impl WhenDone {
             WhenDone::Exit => "Exit",
         }
     }
+
+    /// Kunci stabil untuk persist di settings (`post_all_action`).
+    fn key(self) -> &'static str {
+        match self {
+            WhenDone::ShutDown => "shutdown",
+            WhenDone::Hibernate => "hibernate",
+            WhenDone::Sleep => "sleep",
+            WhenDone::Exit => "exit",
+        }
+    }
+
+    /// Parse dari kunci settings; `None` (mis. "none"/tak dikenal) = nonaktif.
+    fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "shutdown" => Some(WhenDone::ShutDown),
+            "hibernate" => Some(WhenDone::Hibernate),
+            "sleep" => Some(WhenDone::Sleep),
+            "exit" => Some(WhenDone::Exit),
+            _ => None,
+        }
+    }
 }
 
 /// Setelan "Options on completion" (tab ke-3). Dipersist per-id di `AdmApp`
@@ -350,6 +371,20 @@ struct AdmApp {
     /// Notifikasi desktop saat unduhan selesai (mirror `opt_notify`, dipakai di
     /// `drain_events`; `opt_notify` hanya buffer dialog Options).
     notify_complete: bool,
+    // Post-download actions (global, opsional). Field `post_*` aktif dipakai di
+    // `drain_events`; `opt_post_*` hanya buffer dialog Options.
+    post_open: bool,
+    post_run_cmd: String,
+    /// Aksi saat seluruh antrian selesai (`None` = tak ada).
+    post_all: Option<WhenDone>,
+    opt_post_open: bool,
+    opt_post_run_cmd: String,
+    opt_post_all: Option<WhenDone>,
+    /// Edge-detect "antrian selesai": apakah frame lalu ada unduhan aktif/antri.
+    was_busy: bool,
+    /// Ada unduhan yang Completed sejak terakhir antrian kosong (cegah aksi-daya
+    /// false-positive saat semua hanya di-pause/gagal).
+    had_completion: bool,
     // Dialog About.
     show_about: bool,
     // Dialog Refresh Link (id baris target + buffer URL baru).
@@ -475,6 +510,14 @@ impl AdmApp {
             opt_autostart: false,
             opt_notify: cfg.notify_complete,
             notify_complete: cfg.notify_complete,
+            post_open: cfg.post_open,
+            post_run_cmd: cfg.post_run_cmd.clone(),
+            post_all: WhenDone::from_key(&cfg.post_all_action),
+            opt_post_open: cfg.post_open,
+            opt_post_run_cmd: cfg.post_run_cmd.clone(),
+            opt_post_all: WhenDone::from_key(&cfg.post_all_action),
+            was_busy: false,
+            had_completion: false,
             show_about: false,
             refresh_target: None,
             refresh_url: String::new(),
@@ -503,6 +546,9 @@ impl AdmApp {
             queue_max: self.opt_queue_max,
             limit_kbps: self.opt_limit_kbps,
             notify_complete: self.notify_complete,
+            post_open: self.post_open,
+            post_run_cmd: self.post_run_cmd.clone(),
+            post_all_action: self.post_all.map(|w| w.key().to_string()).unwrap_or_else(|| "none".to_string()),
         });
     }
 
@@ -611,12 +657,20 @@ impl AdmApp {
                         r.status = Status::Completed;
                         dirty = true;
                     }
-                    // Notifikasi desktop (toast) saat selesai, bila diaktifkan.
-                    if self.notify_complete {
-                        if let Some(&i) = self.index.get(&id) {
-                            let filename = self.rows[i].filename.clone();
-                            let path = self.row_path(&self.rows[i]);
+                    // Notifikasi desktop (toast) + post-action per-berkas, bila
+                    // diaktifkan. Tandai untuk aksi-daya antrian (edge di bawah).
+                    self.had_completion = true;
+                    if let Some(&i) = self.index.get(&id) {
+                        let filename = self.rows[i].filename.clone();
+                        let path = self.row_path(&self.rows[i]);
+                        if self.notify_complete {
                             notify::completed(&filename, &path);
+                        }
+                        if self.post_open {
+                            open_path(&path);
+                        }
+                        if !self.post_run_cmd.trim().is_empty() {
+                            run_post_command(&self.post_run_cmd, &path);
                         }
                     }
                     // Jendela proses auto-tutup saat selesai (digantikan jendela
@@ -658,6 +712,22 @@ impl AdmApp {
         if dirty {
             store::save(&self.rows);
         }
+        // Post-action global "saat seluruh antrian selesai": edge-trigger ketika
+        // tak ada lagi unduhan aktif/antri DAN ada penyelesaian sejak idle terakhir
+        // (hindari false-positive bila semua hanya di-pause/gagal).
+        let busy = self
+            .rows
+            .iter()
+            .any(|r| matches!(r.status, Status::Active | Status::Queued));
+        if self.was_busy && !busy {
+            if self.had_completion {
+                if let Some(w) = self.post_all {
+                    self.pending_power = Some(w);
+                }
+            }
+            self.had_completion = false;
+        }
+        self.was_busy = busy;
         // Eksekusi aksi penyelesaian setelah daftar dipersist. Aksi daya dijalankan
         // lebih dulu (lalu app keluar); exit murni bila tak ada aksi daya.
         if let Some(w) = self.pending_power.take() {
@@ -912,6 +982,9 @@ impl AdmApp {
         self.opt_dir = self.download_dir.display().to_string();
         self.opt_autostart = autostart::is_enabled();
         self.opt_notify = self.notify_complete;
+        self.opt_post_open = self.post_open;
+        self.opt_post_run_cmd = self.post_run_cmd.clone();
+        self.opt_post_all = self.post_all;
         self.show_options = true;
     }
 
@@ -939,6 +1012,9 @@ impl AdmApp {
             autostart::set(self.opt_autostart);
         }
         self.notify_complete = self.opt_notify;
+        self.post_open = self.opt_post_open;
+        self.post_run_cmd = self.opt_post_run_cmd.clone();
+        self.post_all = self.opt_post_all;
         self.save_settings();
     }
 
@@ -1838,6 +1914,30 @@ impl AdmApp {
 
                     ui.label("Notifications:");
                     ui.checkbox(&mut self.opt_notify, "Show desktop notification when a download completes");
+                    ui.end_row();
+
+                    ui.label("When a file completes:");
+                    ui.checkbox(&mut self.opt_post_open, "Open the file automatically");
+                    ui.end_row();
+
+                    ui.label("Run command:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.opt_post_run_cmd)
+                            .hint_text("e.g. notify-send {}  ({} = file path)")
+                            .desired_width(300.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("When all downloads finish:");
+                    let cur = self.opt_post_all.map(|w| w.label()).unwrap_or("Do nothing");
+                    egui::ComboBox::from_id_salt("opt_post_all")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.opt_post_all, None, "Do nothing");
+                            for w in [WhenDone::ShutDown, WhenDone::Hibernate, WhenDone::Sleep, WhenDone::Exit] {
+                                ui.selectable_value(&mut self.opt_post_all, Some(w), w.label());
+                            }
+                        });
                     ui.end_row();
                 });
                 ui.add_space(10.0);
@@ -2924,6 +3024,23 @@ fn open_path(path: &std::path::Path) {
 /// Buka URL di browser default desktop (`xdg-open`), terlepas.
 fn open_url(url: &str) {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Post-action: jalankan perintah shell saat unduhan selesai. `{}` di `cmd`
+/// diganti path berkas (di-quote); bila tak ada `{}`, path diekspos via env
+/// `ADM_FILE`. Dijalankan via `sh -c`, terlepas (best-effort).
+fn run_post_command(cmd: &str, path: &std::path::Path) {
+    let p = path.to_string_lossy();
+    let line = if cmd.contains("{}") {
+        cmd.replace("{}", &format!("'{}'", p.replace('\'', r"'\''")))
+    } else {
+        cmd.to_string()
+    };
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&line)
+        .env("ADM_FILE", path)
+        .spawn();
 }
 
 /// Aksi daya "Options on completion": jalankan via systemd lalu keluar.
