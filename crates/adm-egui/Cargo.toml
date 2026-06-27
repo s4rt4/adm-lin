@@ -31,6 +31,10 @@ mime_guess = "2"
 freedesktop-icons = "0.4"
 # Dekode ikon raster (tema yang pakai PNG); SVG dirender via resvg yang sudah ada.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Notifikasi desktop saat unduhan selesai (D-Bus org.freedesktop.Notifications).
+# Default features memakai zbus async-io — selaras tray ksni (JANGAN aktifkan
+# fitur yang memaksa zbus ke tokio → panic "no reactor"). Lihat catatan rfd.
+notify-rust = "4"
 
 [dev-dependencies]
 tiny_http = "0.12"

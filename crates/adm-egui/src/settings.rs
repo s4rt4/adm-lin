@@ -16,6 +16,8 @@ pub struct Settings {
     pub queue_max: usize,
     /// Batas kecepatan global (KB/s; 0 = tanpa batas).
     pub limit_kbps: u64,
+    /// Tampilkan notifikasi desktop saat unduhan selesai.
+    pub notify_complete: bool,
 }
 
 impl Default for Settings {
@@ -25,6 +27,7 @@ impl Default for Settings {
             download_dir: None,
             queue_max: 1,
             limit_kbps: 0,
+            notify_complete: true,
         }
     }
 }

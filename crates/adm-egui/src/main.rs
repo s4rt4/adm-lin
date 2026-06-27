@@ -7,6 +7,7 @@ mod category;
 mod engine;
 mod fileicon;
 mod ipc;
+mod notify;
 mod scheduler;
 mod settings;
 mod store;
@@ -345,6 +346,10 @@ struct AdmApp {
     opt_queue_max: usize,
     opt_limit_kbps: u64,
     opt_autostart: bool,
+    opt_notify: bool,
+    /// Notifikasi desktop saat unduhan selesai (mirror `opt_notify`, dipakai di
+    /// `drain_events`; `opt_notify` hanya buffer dialog Options).
+    notify_complete: bool,
     // Dialog About.
     show_about: bool,
     // Dialog Refresh Link (id baris target + buffer URL baru).
@@ -468,6 +473,8 @@ impl AdmApp {
             opt_queue_max: cfg.queue_max,
             opt_limit_kbps: cfg.limit_kbps,
             opt_autostart: false,
+            opt_notify: cfg.notify_complete,
+            notify_complete: cfg.notify_complete,
             show_about: false,
             refresh_target: None,
             refresh_url: String::new(),
@@ -495,6 +502,7 @@ impl AdmApp {
             download_dir: Some(self.download_dir.display().to_string()),
             queue_max: self.opt_queue_max,
             limit_kbps: self.opt_limit_kbps,
+            notify_complete: self.notify_complete,
         });
     }
 
@@ -602,6 +610,14 @@ impl AdmApp {
                         r.speed_bps = 0;
                         r.status = Status::Completed;
                         dirty = true;
+                    }
+                    // Notifikasi desktop (toast) saat selesai, bila diaktifkan.
+                    if self.notify_complete {
+                        if let Some(&i) = self.index.get(&id) {
+                            let filename = self.rows[i].filename.clone();
+                            let path = self.row_path(&self.rows[i]);
+                            notify::completed(&filename, &path);
+                        }
                     }
                     // Jendela proses auto-tutup saat selesai (digantikan jendela
                     // complete). "Options on completion": dialog complete / antrekan
@@ -895,6 +911,7 @@ impl AdmApp {
     fn open_options(&mut self) {
         self.opt_dir = self.download_dir.display().to_string();
         self.opt_autostart = autostart::is_enabled();
+        self.opt_notify = self.notify_complete;
         self.show_options = true;
     }
 
@@ -921,6 +938,7 @@ impl AdmApp {
         if self.opt_autostart != autostart::is_enabled() {
             autostart::set(self.opt_autostart);
         }
+        self.notify_complete = self.opt_notify;
         self.save_settings();
     }
 
@@ -1816,6 +1834,10 @@ impl AdmApp {
 
                     ui.label("Run at login:");
                     ui.checkbox(&mut self.opt_autostart, "Start ADM when I log in");
+                    ui.end_row();
+
+                    ui.label("Notifications:");
+                    ui.checkbox(&mut self.opt_notify, "Show desktop notification when a download completes");
                     ui.end_row();
                 });
                 ui.add_space(10.0);
