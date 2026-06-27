@@ -78,6 +78,31 @@ pub fn read_clipboard() -> Option<String> {
     arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
+/// Untuk clipboard monitor: kembalikan URL bila `text` adalah SATU URL http(s)
+/// yang tampak sebagai berkas unduhan (ekstensi dikenali), supaya tak memicu
+/// dialog pada URL halaman biasa. `None` bila bukan kandidat unduhan.
+pub fn clipboard_download_url(text: &str) -> Option<String> {
+    let t = text.trim();
+    if !is_url(t) || t.split_whitespace().count() != 1 {
+        return None;
+    }
+    let path = t.split(['?', '#']).next().unwrap_or("");
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+    if !name.contains('.') {
+        return None;
+    }
+    use crate::category::Category;
+    if Category::from_filename(name) != Category::General {
+        return Some(t.to_string());
+    }
+    // Ekstensi unduhan umum di luar kategori (image disk, paket, dll).
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    const EXTRA: &[&str] = &[
+        "iso", "dmg", "apk", "deb", "rpm", "appimage", "img", "torrent", "msi",
+    ];
+    EXTRA.contains(&ext.as_str()).then(|| t.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +151,26 @@ mod tests {
     #[test]
     fn expand_no_range_passthrough() {
         assert_eq!(expand_pattern("http://s/file.zip"), vec!["http://s/file.zip"]);
+    }
+
+    #[test]
+    fn clipboard_url_matches_downloads_only() {
+        // Berkas dikenali → terima.
+        assert_eq!(
+            clipboard_download_url("https://s.com/a.zip"),
+            Some("https://s.com/a.zip".to_string())
+        );
+        assert_eq!(
+            clipboard_download_url("  http://s.com/dir/setup.exe?x=1  "),
+            Some("http://s.com/dir/setup.exe?x=1".to_string())
+        );
+        // Ekstensi ekstra (iso) → terima.
+        assert!(clipboard_download_url("https://s.com/os.iso").is_some());
+        // Halaman biasa / tanpa ekstensi / multi-token / non-URL → tolak.
+        assert_eq!(clipboard_download_url("https://news.com/article"), None);
+        assert_eq!(clipboard_download_url("https://s.com/page.html"), None);
+        assert_eq!(clipboard_download_url("two https://s.com/a.zip"), None);
+        assert_eq!(clipboard_download_url("just text"), None);
     }
 
     #[test]

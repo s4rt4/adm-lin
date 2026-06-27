@@ -26,6 +26,8 @@ pub struct Settings {
     /// Post-action saat SELURUH antrian selesai:
     /// `"none"` | `"shutdown"` | `"hibernate"` | `"sleep"` | `"exit"`.
     pub post_all_action: String,
+    /// Pantau clipboard; tawarkan dialog Add saat URL berkas disalin.
+    pub monitor_clipboard: bool,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             post_open: false,
             post_run_cmd: String::new(),
             post_all_action: "none".to_string(),
+            monitor_clipboard: false,
         }
     }
 }

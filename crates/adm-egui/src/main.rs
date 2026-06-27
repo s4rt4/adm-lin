@@ -4,6 +4,7 @@
 
 mod autostart;
 mod category;
+mod clipboard;
 mod engine;
 mod fileicon;
 mod ipc;
@@ -380,6 +381,10 @@ struct AdmApp {
     opt_post_open: bool,
     opt_post_run_cmd: String,
     opt_post_all: Option<WhenDone>,
+    /// Clipboard monitor (thread latar) + buffer toggle Options.
+    clip_monitor: clipboard::ClipMonitor,
+    monitor_clipboard: bool,
+    opt_monitor_clipboard: bool,
     /// Edge-detect "antrian selesai": apakah frame lalu ada unduhan aktif/antri.
     was_busy: bool,
     /// Ada unduhan yang Completed sejak terakhir antrian kosong (cegah aksi-daya
@@ -463,6 +468,9 @@ impl AdmApp {
         // Scheduler: thread pemicu start/stop antrian otomatis (jam & hari).
         scheduler::start(engine.clone());
 
+        // Clipboard monitor (thread latar; default mengikuti setelan).
+        let clip_monitor = clipboard::ClipMonitor::start(cc.egui_ctx.clone(), cfg.monitor_clipboard);
+
         // Pulihkan daftar unduhan dari disk (M2) & cegah id baru bentrok.
         let (rows, max_id) = store::load();
         if max_id > 0 {
@@ -516,6 +524,9 @@ impl AdmApp {
             opt_post_open: cfg.post_open,
             opt_post_run_cmd: cfg.post_run_cmd.clone(),
             opt_post_all: WhenDone::from_key(&cfg.post_all_action),
+            clip_monitor,
+            monitor_clipboard: cfg.monitor_clipboard,
+            opt_monitor_clipboard: cfg.monitor_clipboard,
             was_busy: false,
             had_completion: false,
             show_about: false,
@@ -549,6 +560,7 @@ impl AdmApp {
             post_open: self.post_open,
             post_run_cmd: self.post_run_cmd.clone(),
             post_all_action: self.post_all.map(|w| w.key().to_string()).unwrap_or_else(|| "none".to_string()),
+            monitor_clipboard: self.monitor_clipboard,
         });
     }
 
@@ -985,6 +997,7 @@ impl AdmApp {
         self.opt_post_open = self.post_open;
         self.opt_post_run_cmd = self.post_run_cmd.clone();
         self.opt_post_all = self.post_all;
+        self.opt_monitor_clipboard = self.monitor_clipboard;
         self.show_options = true;
     }
 
@@ -1015,6 +1028,8 @@ impl AdmApp {
         self.post_open = self.opt_post_open;
         self.post_run_cmd = self.opt_post_run_cmd.clone();
         self.post_all = self.opt_post_all;
+        self.monitor_clipboard = self.opt_monitor_clipboard;
+        self.clip_monitor.set_enabled(self.monitor_clipboard);
         self.save_settings();
     }
 
@@ -1199,6 +1214,18 @@ impl AdmApp {
         });
     }
 
+    /// Clipboard monitor: bila ada URL berkas baru disalin, buka dialog Add
+    /// terisi (kecuali dialog Add sudah terbuka). User tetap menekan Start.
+    fn drain_clipboard(&mut self, ctx: &egui::Context) {
+        let Some(url) = self.clip_monitor.take() else { return };
+        if self.show_add {
+            return;
+        }
+        self.add_url = url;
+        self.open_add(ctx, false, "");
+        Self::bring_to_front(ctx);
+    }
+
     /// Proses hasil dialog Export/Import yang sudah tiba dari portal.
     fn drain_file_pick(&mut self) {
         let pick = self.file_pick.lock().unwrap().take();
@@ -1227,6 +1254,7 @@ impl eframe::App for AdmApp {
         self.drain_events();
         self.drain_ipc(ui.ctx());
         self.drain_file_pick();
+        self.drain_clipboard(ui.ctx());
         self.handle_close(ui.ctx());
 
         // Pintasan: Ctrl+F = Find, F3 = Find Next.
@@ -1914,6 +1942,10 @@ impl AdmApp {
 
                     ui.label("Notifications:");
                     ui.checkbox(&mut self.opt_notify, "Show desktop notification when a download completes");
+                    ui.end_row();
+
+                    ui.label("Clipboard:");
+                    ui.checkbox(&mut self.opt_monitor_clipboard, "Monitor clipboard for download links");
                     ui.end_row();
 
                     ui.label("When a file completes:");
