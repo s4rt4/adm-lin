@@ -279,8 +279,9 @@ struct ProgressUi {
     tab: usize,
     /// Area detail (segment bar + tabel koneksi) tampil — tombol Hide/Show details.
     details: bool,
-    /// Tampilkan URL unduhan (default sembunyi — link panjang merusak layout).
-    show_url: bool,
+    /// Pernah dirender (baris-nya sudah ada di index). Membedakan "baris belum
+    /// dibuat engine" (tahan dialog) vs "baris dihapus" (tutup dialog).
+    shown: bool,
     // Tab Speed Limiter.
     limit_on: bool,
     limit_kbps: u64,
@@ -293,7 +294,7 @@ impl Default for ProgressUi {
         Self {
             tab: 0,
             details: true,
-            show_url: false,
+            shown: false,
             limit_on: false,
             limit_kbps: 0,
             completion: CompletionOpts::default(),
@@ -402,6 +403,9 @@ struct AdmApp {
     clip_monitor: clipboard::ClipMonitor,
     monitor_clipboard: bool,
     opt_monitor_clipboard: bool,
+    /// Tampilkan dialog "Download complete" (global; dimatikan via checkbox
+    /// "Don't show this dialog again" di dialog complete). Persist di settings.
+    show_complete_dialog: bool,
     /// Edge-detect "antrian selesai": apakah frame lalu ada unduhan aktif/antri.
     was_busy: bool,
     /// Ada unduhan yang Completed sejak terakhir antrian kosong (cegah aksi-daya
@@ -554,6 +558,7 @@ impl AdmApp {
             clip_monitor,
             monitor_clipboard: cfg.monitor_clipboard,
             opt_monitor_clipboard: cfg.monitor_clipboard,
+            show_complete_dialog: cfg.show_complete_dialog,
             was_busy: false,
             had_completion: false,
             show_about: false,
@@ -588,6 +593,7 @@ impl AdmApp {
             post_run_cmd: self.post_run_cmd.clone(),
             post_all_action: self.post_all.map(|w| w.key().to_string()).unwrap_or_else(|| "none".to_string()),
             monitor_clipboard: self.monitor_clipboard,
+            show_complete_dialog: self.show_complete_dialog,
         });
     }
 
@@ -730,7 +736,7 @@ impl AdmApp {
                     // exit / aksi daya (dieksekusi setelah persist di bawah).
                     if let Some(opts) = self.completion.get(&id).copied() {
                         self.progress_open.remove(&id);
-                        if opts.show_complete {
+                        if opts.show_complete && self.show_complete_dialog {
                             self.complete_open.insert(id);
                         }
                         if opts.exit_done {
@@ -1572,20 +1578,29 @@ impl AdmApp {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("statusbar").show_inside(ui, |ui| {
-            let active = self.rows.iter().filter(|r| r.status == Status::Active).count();
-            let total_speed: u64 = self.rows.iter().map(|r| r.speed_bps).sum();
-            ui.horizontal(|ui| {
-                ui.label(format!("{} download(s)", self.rows.len()));
-                ui.separator();
-                ui.label(format!("{active} active"));
-                ui.separator();
-                ui.label(format!("{}/s", human_bytes(total_speed)));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(self.download_dir.display().to_string());
+        // Bilah status ramping: margin vertikal minim + teks kecil (gaya IDM).
+        let frame = egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 1))
+            .fill(ui.style().visuals.panel_fill);
+        egui::Panel::bottom("statusbar")
+            .frame(frame)
+            .show_inside(ui, |ui| {
+                let active = self.rows.iter().filter(|r| r.status == Status::Active).count();
+                let total_speed: u64 = self.rows.iter().map(|r| r.speed_bps).sum();
+                let small = |ui: &mut egui::Ui, t: String| {
+                    ui.label(egui::RichText::new(t).small());
+                };
+                ui.horizontal(|ui| {
+                    small(ui, format!("{} download(s)", self.rows.len()));
+                    ui.separator();
+                    small(ui, format!("{active} active"));
+                    ui.separator();
+                    small(ui, format!("{}/s", human_bytes(total_speed)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        small(ui, self.download_dir.display().to_string());
+                    });
                 });
             });
-        });
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -2404,13 +2419,20 @@ impl AdmApp {
         let mut to_open = Vec::new();
         let mut to_limit: Vec<(u64, u64)> = Vec::new();
         for id in ids {
-            let Some(&i) = self.index.get(&id) else {
-                to_close.push(id);
-                continue;
-            };
             // Keluarkan state dialog (owned) agar bisa di-mutate sembari meminjam
             // `self.rows` immutable; dikembalikan setelah render bila masih dibuka.
             let mut st = self.progress_open.remove(&id).unwrap_or_default();
+            let Some(&i) = self.index.get(&id) else {
+                // Baris belum ada di index. Saat Start, `add_download` membuka dialog
+                // sebelum event Started membuat baris → tahan dialog (jangan tutup)
+                // sampai baris muncul. Bila SUDAH pernah tampil lalu hilang = baris
+                // dihapus → tutup beneran.
+                if !st.shown {
+                    self.progress_open.insert(id, st);
+                }
+                continue;
+            };
+            st.shown = true;
             let r = &self.rows[i];
 
             let pct = match r.total {
@@ -2428,24 +2450,72 @@ impl AdmApp {
             // Dialog progress = jendela OS tersendiri (viewport), terlepas dari
             // jendela utama: bisa digeser/ditutup sendiri, tak ikut induk di dock.
             let vid = egui::ViewportId::from_hash_of(("adm-progress", id));
+            // Ukuran ringkas gaya IDM; cukup tinggi untuk segmen + tabel saat detail.
             let builder = egui::ViewportBuilder::default()
                 .with_title(&title)
-                .with_inner_size([560.0, 380.0])
+                .with_inner_size([500.0, 470.0])
+                .with_min_inner_size([420.0, 240.0])
                 .with_resizable(true)
                 .with_minimize_button(true);
             let mut closed = false;
             ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.set_min_width(500.0);
-
-                    // ---- Bar tab (emulasi SysTabControl versi Windows) ----
+                // ---- Bar tab (emulasi SysTabControl versi Windows) — panel atas ----
+                egui::Panel::top("pg-tabs").show(ctx, |ui| {
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut st.tab, 0usize, "Download status");
                         ui.selectable_value(&mut st.tab, 1usize, "Speed Limiter");
                         ui.selectable_value(&mut st.tab, 2usize, "Options on completion");
                     });
-                    ui.separator();
+                    ui.add_space(2.0);
+                });
 
+                // ---- Tombol aksi: HANYA di tab Download status, ditambat ke bawah
+                // (panel bawah) supaya tak pernah terpotong walau detail panjang ----
+                if st.tab == 0 {
+                    egui::Panel::bottom("pg-buttons").show(ctx, |ui| {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let det_label =
+                                if st.details { "<< Hide details" } else { "Show details >>" };
+                            if ui.button(det_label).clicked() {
+                                st.details = !st.details;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Close").clicked() {
+                                        to_close.push(id);
+                                    }
+                                    if r.status == Status::Completed {
+                                        if ui.button("Open").clicked() {
+                                            to_open.push(id);
+                                        }
+                                    } else if ui.button("Cancel").clicked() {
+                                        to_cancel.push(id);
+                                    }
+                                    match r.status {
+                                        Status::Active => {
+                                            if ui.button("Pause").clicked() {
+                                                to_pause.push(id);
+                                            }
+                                        }
+                                        Status::Paused | Status::Failed => {
+                                            if ui.button("Resume").clicked() {
+                                                to_resume.push(id);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
+                    });
+                }
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_min_width(420.0);
                     match st.tab {
                         0 => Self::pg_tab_status(ui, id, r, &mut st),
                         1 => {
@@ -2456,44 +2526,6 @@ impl AdmApp {
                         }
                         _ => Self::pg_tab_options(ui, id, &mut st),
                     }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    // ---- Tombol bawah (semua tab): Hide details | Resume/Pause Cancel Close ----
-                    ui.horizontal(|ui| {
-                        let det_label = if st.details { "<< Hide details" } else { "Show details >>" };
-                        if ui
-                            .add_enabled(st.tab == 0, egui::Button::new(det_label))
-                            .clicked()
-                        {
-                            st.details = !st.details;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Close").clicked() {
-                                to_close.push(id);
-                            }
-                            if r.status == Status::Completed {
-                                if ui.button("Open").clicked() {
-                                    to_open.push(id);
-                                }
-                            } else if ui.button("Cancel").clicked() {
-                                to_cancel.push(id);
-                            }
-                            match r.status {
-                                Status::Active => {
-                                    if ui.button("Pause").clicked() {
-                                        to_pause.push(id);
-                                    }
-                                }
-                                Status::Paused | Status::Failed => {
-                                    if ui.button("Resume").clicked() {
-                                        to_resume.push(id);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        });
-                    });
                 });
                 // Tombol X jendela.
                 if ctx.input(|i| i.viewport().close_requested()) {
@@ -2538,20 +2570,20 @@ impl AdmApp {
     /// Tab 1: "Download status" — info + progress bar + (detail) segment bar &
     /// tabel koneksi (N. / Downloaded / Info), mirror versi Windows.
     fn pg_tab_status(ui: &mut egui::Ui, id: u64, r: &Row, st: &mut ProgressUi) {
-        ui.add_space(4.0);
-        ui.strong(&r.filename);
-        // URL disembunyikan default — link panjang bikin layout jelek. Toggle.
-        let link_label = if st.show_url { "▾ Hide link" } else { "▸ Show link" };
-        if ui.small_button(link_label).clicked() {
-            st.show_url = !st.show_url;
-        }
-        if st.show_url {
-            ui.add(egui::Label::new(egui::RichText::new(&r.url).weak().small()));
-        }
         ui.add_space(6.0);
+        // URL gaya IDM: satu baris biru, dipangkas bila panjang (jendela resizable).
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&r.url).color(ui.visuals().hyperlink_color),
+            )
+            .truncate(),
+        );
+        ui.add_space(8.0);
+        // Info ringkas (label kiri, nilai sejajar) — spasi rapat gaya IDM.
         egui::Grid::new(format!("pg-grid-{id}"))
             .num_columns(2)
-            .spacing([16.0, 7.0])
+            .spacing([14.0, 4.0])
+            .min_col_width(110.0)
             .show(ui, |ui| {
                 ui.label("Status:");
                 ui.label(status_line_idm(r));
@@ -2585,7 +2617,13 @@ impl AdmApp {
             Some(t) if t > 0 => (r.downloaded as f32 / t as f32).clamp(0.0, 1.0),
             _ => 0.0,
         };
-        ui.add(egui::ProgressBar::new(frac).show_percentage());
+        // Bilah tipis & datar bergaya IDM (hijau), persentase ada di judul jendela.
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_height(15.0)
+                .corner_radius(2.0)
+                .fill(egui::Color32::from_rgb(70, 160, 70)),
+        );
 
         if st.details {
             ui.add_space(10.0);
@@ -2593,8 +2631,12 @@ impl AdmApp {
             ui.add_space(4.0);
             segment_bar(ui, &r.segments, r.total);
             ui.add_space(8.0);
+            // Scrollbar solid (bukan mengambang) agar menyisakan ruang & tak
+            // menimpa teks kolom "Info" saat baris koneksi banyak.
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             egui::ScrollArea::vertical()
                 .max_height(150.0)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     egui::Grid::new(format!("seg-grid-{id}"))
                         .num_columns(3)
@@ -2679,6 +2721,7 @@ impl AdmApp {
         let mut to_close = Vec::new();
         let mut to_open = Vec::new();
         let mut to_folder = Vec::new();
+        let mut dont_show_again = false;
         for id in ids {
             let Some(&i) = self.index.get(&id) else {
                 to_close.push(id);
@@ -2690,33 +2733,70 @@ impl AdmApp {
             let vid = egui::ViewportId::from_hash_of(("adm-complete", id));
             let builder = egui::ViewportBuilder::default()
                 .with_title("Download complete")
-                .with_inner_size([440.0, 200.0])
+                .with_inner_size([480.0, 250.0])
                 .with_resizable(false)
                 .with_minimize_button(false)
                 .with_maximize_button(false);
+            let bytes = r.total.unwrap_or(r.downloaded);
             let mut closed = false;
             ctx.show_viewport_immediate(vid, builder, |ctx, _class| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add_space(4.0);
-                    ui.strong("Download complete");
-                    ui.add_space(8.0);
-                    ui.label(&r.filename);
-                    let sz = r.total.map(human_bytes).unwrap_or_else(|| human_bytes(r.downloaded));
-                    ui.weak(format!("Downloaded {sz}"));
+                // Tombol + checkbox "don't show again" ditambat ke bawah (gaya IDM)
+                // supaya tak pernah terpotong oleh isi di atasnya.
+                egui::Panel::bottom("cmpl-buttons").show(ctx, |ui| {
                     ui.add_space(6.0);
-                    ui.weak(path.display().to_string());
-                    ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Open").clicked() {
-                            to_open.push(id);
-                        }
-                        if ui.button("Open folder").clicked() {
-                            to_folder.push(id);
-                        }
-                        if ui.button("Close").clicked() {
-                            to_close.push(id);
-                        }
+                        ui.checkbox(&mut dont_show_again, "Don't show this dialog again");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.button("Close").clicked() {
+                                    to_close.push(id);
+                                }
+                                if ui.button("Open folder").clicked() {
+                                    to_folder.push(id);
+                                }
+                                if ui.button("Open").clicked() {
+                                    to_open.push(id);
+                                }
+                            },
+                        );
                     });
+                    ui.add_space(6.0);
+                });
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(6.0);
+                    // Header gaya IDM: judul + ukuran terunduh (MB + bytes).
+                    ui.heading("Download complete");
+                    ui.add_space(2.0);
+                    ui.weak(format!("Downloaded {} ({} bytes)", human_bytes(bytes), bytes));
+                    ui.add_space(12.0);
+
+                    // Field "Address" (URL) — kotak grup, dipangkas bila panjang.
+                    ui.label("Address:");
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(&r.url).color(ui.visuals().hyperlink_color),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    ui.add_space(8.0);
+
+                    // Field "The file saved as" (path tujuan).
+                    ui.label("The file saved as:");
+                    egui::Frame::group(ui.style())
+                        .inner_margin(egui::Margin::symmetric(6, 3))
+                        .show(ui, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 18.0],
+                                egui::Label::new(path.display().to_string()).truncate(),
+                            );
+                        });
                 });
                 if ctx.input(|i| i.viewport().close_requested()) {
                     closed = true;
@@ -2725,6 +2805,13 @@ impl AdmApp {
             if closed {
                 to_close.push(id);
             }
+        }
+        // Checkbox "Don't show this dialog again" → matikan dialog complete global.
+        if dont_show_again {
+            self.show_complete_dialog = false;
+            self.save_settings();
+            // Tutup semua dialog complete yang sedang terbuka.
+            to_close.extend(self.complete_open.iter().copied());
         }
         for id in to_open {
             if let Some(&i) = self.index.get(&id) {
@@ -2999,7 +3086,7 @@ fn conn_info(status: Status, dl: u64, len: u64) -> String {
 /// byte-nya pada keseluruhan berkas; sisa rentang abu-abu, dibatasi garis pemisah.
 fn segment_bar(ui: &mut egui::Ui, segments: &[(u64, u64, u64)], total: Option<u64>) {
     let width = ui.available_width();
-    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, 26.0), egui::Sense::hover());
+    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
     let dark = ui.visuals().dark_mode;
     let bg = if dark { egui::Color32::from_gray(38) } else { egui::Color32::from_gray(245) };
     let pending = if dark { egui::Color32::from_gray(70) } else { egui::Color32::from_gray(210) };

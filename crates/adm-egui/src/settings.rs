@@ -28,6 +28,9 @@ pub struct Settings {
     pub post_all_action: String,
     /// Pantau clipboard; tawarkan dialog Add saat URL berkas disalin.
     pub monitor_clipboard: bool,
+    /// Tampilkan dialog "Download complete" saat unduhan selesai (gaya IDM).
+    /// Dimatikan lewat checkbox "Don't show this dialog again" di dialog itu.
+    pub show_complete_dialog: bool,
 }
 
 impl Default for Settings {
@@ -42,6 +45,7 @@ impl Default for Settings {
             post_run_cmd: String::new(),
             post_all_action: "none".to_string(),
             monitor_clipboard: false,
+            show_complete_dialog: true,
         }
     }
 }
